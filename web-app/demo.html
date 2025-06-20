@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pixel Image Analysis - Simple Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .upload-section {
+            border: 2px dashed #ccc;
+            padding: 30px;
+            text-align: center;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            background-color: #fafafa;
+        }
+        
+        .upload-section.dragover {
+            border-color: #007bff;
+            background-color: #e7f3ff;
+        }
+        
+        input[type="file"] {
+            margin: 15px 0;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            width: 100%;
+            max-width: 300px;
+        }
+        
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px 5px;
+            min-width: 120px;
+        }
+        
+        button:hover:not(:disabled) {
+            background-color: #0056b3;
+        }
+        
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .preview-section {
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        #imagePreview {
+            max-width: 400px;
+            max-height: 300px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        
+        .results-section {
+            background-color: #f8f9fa;
+            padding: 20px;
+            border-radius: 6px;
+            margin-top: 20px;
+            border-left: 4px solid #007bff;
+        }
+        
+        .results-section h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        
+        .result-item {
+            margin: 10px 0;
+            font-size: 16px;
+        }
+        
+        .result-value {
+            font-weight: bold;
+            color: #007bff;
+        }
+        
+        .error {
+            color: #dc3545;
+            background-color: #f8d7da;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        
+        .loading {
+            color: #6c757d;
+            font-style: italic;
+        }
+        
+        .info {
+            color: #6c757d;
+            font-size: 14px;
+            margin-top: 20px;
+            line-height: 1.5;
+        }
+        
+        .step {
+            background-color: #e9ecef;
+            padding: 8px 12px;
+            margin: 5px 0;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Pixel Image Analysis</h1>
+        <p style="text-align: center; color: #6c757d;">
+            Upload an image to analyze its pixel spacing using derivative-based edge detection
+        </p>
+        
+        <div class="upload-section" id="uploadSection">
+            <p><strong>Choose an image file or drag and drop here</strong></p>
+            <input type="file" id="fileInput" accept="image/*">
+            <p style="color: #6c757d; font-size: 14px;">
+                Supported formats: JPG, PNG, GIF, WebP
+            </p>
+        </div>
+        
+        <div class="preview-section" id="previewSection" style="display: none;">
+            <h3>Image Preview</h3>
+            <img id="imagePreview" alt="Image preview">
+            <div style="margin-top: 10px;">
+                <button id="analyzeBtn" disabled>🔬 Analyze Image</button>
+                <button id="clearBtn">🗑️ Clear</button>
+            </div>
+        </div>
+        
+        <div id="loadingSection" style="display: none;">
+            <div class="step">📷 Image loaded successfully</div>
+            <div class="step">🔄 Converting to greyscale...</div>
+            <div class="step">📊 Applying edge detection...</div>
+            <div class="step">📈 Creating 1D profiles...</div>
+            <div class="step">🎯 Finding peaks...</div>
+            <div class="step">⚡ Calculating optimal spacing...</div>
+        </div>
+        
+        <div class="results-section" id="resultsSection" style="display: none;">
+            <h3>📋 Analysis Results</h3>
+            <div id="results"></div>
+        </div>
+        
+        <div class="results-section" id="debugSection" style="display: none;">
+            <h3>🐛 Debug Output</h3>
+            <div id="debugOutput" style="font-family: monospace; font-size: 12px; max-height: 400px; overflow-y: auto; background: #f8f9fa; padding: 10px; border: 1px solid #ddd; border-radius: 4px; display: none;"></div>
+            <button id="toggleDebug" style="margin-top: 10px; font-size: 12px;">Show Debug Output</button>
+        </div>
+        
+        <div class="info">
+            <h4>How it works:</h4>
+            <p>This tool implements the same image analysis pipeline from the Jupyter notebook:</p>
+            <ol>
+                <li><strong>Greyscale Conversion:</strong> Convert the image to greyscale using luminance weights</li>
+                <li><strong>Edge Detection:</strong> Apply second-order derivative edge detection along both axes</li>
+                <li><strong>Profile Creation:</strong> Average edge data to create 1D horizontal and vertical profiles</li>
+                <li><strong>Peak Finding:</strong> Detect peaks in the profiles using adaptive thresholding</li>
+                <li><strong>Spacing Optimization:</strong> Find the optimal pixel spacing that best fits the detected peaks</li>
+            </ol>
+            <p>The analysis is performed entirely in WebAssembly for maximum performance.</p>
+        </div>
+    </div>
+
+    <script type="module">
+        import init, { analyze_image_spacing } from './pkg/pixel_image_reconstruction.js';
+        
+        let wasmModule;
+        let debugOutput = [];
+        let originalConsoleLog = console.log;
+        
+        // Capture console output
+        console.log = function(...args) {
+            const message = args.join(' ');
+            debugOutput.push(message);
+            updateDebugDisplay();
+            originalConsoleLog.apply(console, args);
+        };
+        
+        function updateDebugDisplay() {
+            const debugDiv = document.getElementById('debugOutput');
+            debugDiv.innerHTML = debugOutput.join('<br>');
+            debugDiv.scrollTop = debugDiv.scrollHeight;
+        }
+        
+        function clearDebugOutput() {
+            debugOutput = [];
+            updateDebugDisplay();
+        }
+        
+        async function initWasm() {
+            try {
+                wasmModule = await init();
+                console.log('WASM module initialized successfully');
+            } catch (error) {
+                console.error('Failed to initialize WASM module:', error);
+                showError('Failed to load WebAssembly module. Please refresh the page.');
+            }
+        }
+        
+        function showError(message) {
+            const resultsSection = document.getElementById('resultsSection');
+            resultsSection.style.display = 'block';
+            resultsSection.innerHTML = `<div class="error">❌ ${message}</div>`;
+        }
+        
+        function showLoading() {
+            document.getElementById('loadingSection').style.display = 'block';
+            document.getElementById('resultsSection').style.display = 'none';
+        }
+        
+        function hideLoading() {
+            document.getElementById('loadingSection').style.display = 'none';
+        }
+        
+        function showResults(horizontalSpacing, verticalSpacing) {
+            hideLoading();
+            
+            const resultsSection = document.getElementById('resultsSection');
+            const results = document.getElementById('results');
+            
+            let html = '';
+            
+            if (horizontalSpacing > 0) {
+                html += `<div class="result-item">
+                    📏 <strong>Horizontal Spacing:</strong> 
+                    <span class="result-value">${horizontalSpacing.toFixed(3)} pixels</span>
+                </div>`;
+            } else {
+                html += `<div class="result-item">
+                    📏 <strong>Horizontal Spacing:</strong> 
+                    <span style="color: #6c757d;">Could not determine (no clear peaks found)</span>
+                </div>`;
+            }
+            
+            if (verticalSpacing > 0) {
+                html += `<div class="result-item">
+                    📐 <strong>Vertical Spacing:</strong> 
+                    <span class="result-value">${verticalSpacing.toFixed(3)} pixels</span>
+                </div>`;
+            } else {
+                html += `<div class="result-item">
+                    📐 <strong>Vertical Spacing:</strong> 
+                    <span style="color: #6c757d;">Could not determine (no clear peaks found)</span>
+                </div>`;
+            }
+            
+            // Add interpretation
+            if (horizontalSpacing > 0 && verticalSpacing > 0) {
+                const ratio = horizontalSpacing / verticalSpacing;
+                html += `<div class="result-item" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #ddd;">
+                    🔍 <strong>Analysis:</strong><br>
+                    <span style="font-size: 14px; color: #6c757d;">
+                        Aspect ratio: ${ratio.toFixed(2)}:1 
+                        ${Math.abs(ratio - 1) < 0.1 ? '(Nearly square pixels)' : 
+                          ratio > 1.2 ? '(Horizontally stretched)' : 
+                          ratio < 0.8 ? '(Vertically stretched)' : ''}
+                    </span>
+                </div>`;
+            }
+            
+            results.innerHTML = html;
+            resultsSection.style.display = 'block';
+        }
+        
+        function loadImageToCanvas(file) {
+            const img = new Image();
+            const preview = document.getElementById('imagePreview');
+            
+            img.onload = function() {
+                // Show preview
+                preview.src = img.src;
+                document.getElementById('previewSection').style.display = 'block';
+                document.getElementById('analyzeBtn').disabled = false;
+                
+                console.log(`Image loaded: ${img.width}x${img.height}`);
+            };
+            
+            img.onerror = function() {
+                showError('Failed to load the selected image. Please try a different file.');
+            };
+            
+            img.src = URL.createObjectURL(file);
+        }
+        
+        async function analyzeImage() {
+            const img = document.getElementById('imagePreview');
+            
+            // Clear previous debug output
+            clearDebugOutput();
+            
+            // Create a canvas to get image data
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+            
+            ctx.drawImage(img, 0, 0);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            
+            showLoading();
+            
+            try {
+                console.log(`Starting analysis of ${canvas.width}x${canvas.height} image`);
+                
+                // Call the WASM function
+                const result = analyze_image_spacing(
+                    imageData.data, 
+                    canvas.width, 
+                    canvas.height
+                );
+                
+                console.log('Analysis completed:', result);
+                
+                const [horizontalSpacing, verticalSpacing] = result;
+                showResults(horizontalSpacing, verticalSpacing);
+                
+                // Show debug section
+                document.getElementById('debugSection').style.display = 'block';
+                
+            } catch (error) {
+                console.error('Analysis failed:', error);
+                hideLoading();
+                showError('Analysis failed. Please try a different image or refresh the page.');
+            }
+        }
+        
+        function clearAll() {
+            document.getElementById('previewSection').style.display = 'none';
+            document.getElementById('resultsSection').style.display = 'none';
+            document.getElementById('loadingSection').style.display = 'none';
+            document.getElementById('debugSection').style.display = 'none';
+            document.getElementById('fileInput').value = '';
+            document.getElementById('analyzeBtn').disabled = true;
+            clearDebugOutput();
+        }
+        
+        function toggleDebugOutput() {
+            const debugDiv = document.getElementById('debugOutput');
+            const toggleBtn = document.getElementById('toggleDebug');
+            
+            if (debugDiv.style.display === 'none') {
+                debugDiv.style.display = 'block';
+                toggleBtn.textContent = 'Hide Debug Output';
+            } else {
+                debugDiv.style.display = 'none';
+                toggleBtn.textContent = 'Show Debug Output';
+            }
+        }
+        
+        // Event listeners
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            if (e.target.files.length > 0) {
+                loadImageToCanvas(e.target.files[0]);
+            }
+        });
+        
+        document.getElementById('analyzeBtn').addEventListener('click', analyzeImage);
+        document.getElementById('clearBtn').addEventListener('click', clearAll);
+        document.getElementById('toggleDebug').addEventListener('click', toggleDebugOutput);
+        
+        // Drag and drop support
+        const uploadSection = document.getElementById('uploadSection');
+        
+        uploadSection.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            uploadSection.classList.add('dragover');
+        });
+        
+        uploadSection.addEventListener('dragleave', function(e) {
+            e.preventDefault();
+            uploadSection.classList.remove('dragover');
+        });
+        
+        uploadSection.addEventListener('drop', function(e) {
+            e.preventDefault();
+            uploadSection.classList.remove('dragover');
+            
+            const files = e.dataTransfer.files;
+            if (files.length > 0 && files[0].type.startsWith('image/')) {
+                document.getElementById('fileInput').files = files;
+                loadImageToCanvas(files[0]);
+            }
+        });
+        
+        // Initialize WASM when page loads
+        initWasm().catch(console.error);
+    </script>
+</body>
+</html>

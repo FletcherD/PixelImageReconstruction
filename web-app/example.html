@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pixel Image Reconstruction - WASM Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+        .panel {
+            border: 1px solid #ccc;
+            padding: 15px;
+            border-radius: 5px;
+            min-width: 300px;
+        }
+        canvas {
+            border: 1px solid #ddd;
+            max-width: 100%;
+        }
+        .results {
+            background-color: #f5f5f5;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 3px;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        #fileInput {
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Pixel Image Reconstruction - WASM Demo</h1>
+    <p>This demo shows the Rust-based image analysis functions compiled to WebAssembly.</p>
+    
+    <div class="container">
+        <div class="panel">
+            <h3>Image Input</h3>
+            <input type="file" id="fileInput" accept="image/*">
+            <br>
+            <canvas id="originalCanvas" width="400" height="300"></canvas>
+            <div class="results">
+                <p><strong>Image Info:</strong></p>
+                <div id="imageInfo">No image loaded</div>
+            </div>
+        </div>
+        
+        <div class="panel">
+            <h3>Edge Detection</h3>
+            <button id="detectEdges" disabled>Detect Edges</button>
+            <br>
+            <canvas id="edgeCanvas" width="400" height="300"></canvas>
+        </div>
+        
+        <div class="panel">
+            <h3>Profile Analysis</h3>
+            <button id="createProfiles" disabled>Create 1D Profiles</button>
+            <br>
+            <canvas id="profileCanvas" width="400" height="200"></canvas>
+            <div class="results">
+                <div id="profileInfo">No profiles created</div>
+            </div>
+        </div>
+        
+        <div class="panel">
+            <h3>Peak Detection & Spacing Analysis</h3>
+            <button id="findPeaks" disabled>Find Peaks</button>
+            <button id="calculateSpacing" disabled>Calculate Optimal Spacing</button>
+            <div class="results">
+                <div id="analysisResults">No analysis performed</div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import init, { ImageAnalysis } from './pkg/pixel_image_reconstruction.js';
+        
+        let imageAnalysis;
+        let wasmModule;
+        
+        async function initWasm() {
+            wasmModule = await init();
+            imageAnalysis = new ImageAnalysis();
+            console.log('WASM module initialized');
+        }
+        
+        function loadImageToCanvas(file) {
+            const canvas = document.getElementById('originalCanvas');
+            const ctx = canvas.getContext('2d');
+            const img = new Image();
+            
+            img.onload = function() {
+                // Resize canvas to fit image
+                const maxWidth = 400;
+                const maxHeight = 300;
+                let { width, height } = img;
+                
+                if (width > maxWidth) {
+                    height = (height * maxWidth) / width;
+                    width = maxWidth;
+                }
+                if (height > maxHeight) {
+                    width = (width * maxHeight) / height;
+                    height = maxHeight;
+                }
+                
+                canvas.width = width;
+                canvas.height = height;
+                
+                ctx.drawImage(img, 0, 0, width, height);
+                
+                // Get image data and pass to WASM
+                const imageData = ctx.getImageData(0, 0, width, height);
+                imageAnalysis.load_image_data(imageData.data, width, height);
+                
+                // Update UI
+                document.getElementById('imageInfo').innerHTML = 
+                    `Dimensions: ${width} × ${height}<br>Total pixels: ${width * height}`;
+                document.getElementById('detectEdges').disabled = false;
+                
+                console.log('Image loaded successfully');
+            };
+            
+            img.src = URL.createObjectURL(file);
+        }
+        
+        function detectEdges() {
+            imageAnalysis.apply_edge_detection();
+            
+            const edgeData = imageAnalysis.get_edge_data();
+            const [width, height] = imageAnalysis.get_dimensions();
+            
+            if (edgeData) {
+                // Display edge detection result
+                const canvas = document.getElementById('edgeCanvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = width;
+                canvas.height = height;
+                
+                const imageData = ctx.createImageData(width, height);
+                
+                // Convert edge data to grayscale image
+                for (let i = 0; i < edgeData.length; i++) {
+                    const value = Math.min(255, Math.max(0, edgeData[i] * 10)); // Scale for visibility
+                    const pixelIndex = i * 4;
+                    imageData.data[pixelIndex] = value;     // R
+                    imageData.data[pixelIndex + 1] = value; // G
+                    imageData.data[pixelIndex + 2] = value; // B
+                    imageData.data[pixelIndex + 3] = 255;   // A
+                }
+                
+                ctx.putImageData(imageData, 0, 0);
+                document.getElementById('createProfiles').disabled = false;
+                console.log('Edge detection completed');
+            }
+        }
+        
+        function createProfiles() {
+            imageAnalysis.create_profiles();
+            
+            const hProfile = imageAnalysis.get_horizontal_profile();
+            const vProfile = imageAnalysis.get_vertical_profile();
+            
+            if (hProfile && vProfile) {
+                // Plot profiles
+                const canvas = document.getElementById('profileCanvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = 400;
+                canvas.height = 200;
+                
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                
+                // Draw horizontal profile in blue
+                ctx.strokeStyle = 'blue';
+                ctx.beginPath();
+                for (let i = 0; i < hProfile.length; i++) {
+                    const x = (i / hProfile.length) * canvas.width;
+                    const y = canvas.height / 2 - hProfile[i] * 10; // Scale and center
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+                
+                // Draw vertical profile in red
+                ctx.strokeStyle = 'red';
+                ctx.beginPath();
+                for (let i = 0; i < vProfile.length; i++) {
+                    const x = (i / vProfile.length) * canvas.width;
+                    const y = canvas.height / 2 - vProfile[i] * 10; // Scale and center
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+                
+                // Draw center line
+                ctx.strokeStyle = 'gray';
+                ctx.beginPath();
+                ctx.moveTo(0, canvas.height / 2);
+                ctx.lineTo(canvas.width, canvas.height / 2);
+                ctx.stroke();
+                
+                document.getElementById('profileInfo').innerHTML = 
+                    `Horizontal profile: ${hProfile.length} points<br>Vertical profile: ${vProfile.length} points`;
+                document.getElementById('findPeaks').disabled = false;
+                console.log('Profiles created');
+            }
+        }
+        
+        function findPeaks() {
+            imageAnalysis.find_peaks();
+            
+            const hPeaks = imageAnalysis.get_horizontal_peaks();
+            const vPeaks = imageAnalysis.get_vertical_peaks();
+            
+            if (hPeaks && vPeaks) {
+                document.getElementById('analysisResults').innerHTML = 
+                    `Horizontal peaks found: ${hPeaks.length}<br>Vertical peaks found: ${vPeaks.length}`;
+                document.getElementById('calculateSpacing').disabled = false;
+                console.log('Peaks found:', { horizontal: hPeaks.length, vertical: vPeaks.length });
+            }
+        }
+        
+        function calculateSpacing() {
+            imageAnalysis.calculate_optimal_spacing();
+            
+            const hSpacing = imageAnalysis.get_horizontal_spacing();
+            const vSpacing = imageAnalysis.get_vertical_spacing();
+            
+            let results = '<h4>Optimal Spacing Results:</h4>';
+            if (hSpacing !== undefined && hSpacing !== null) {
+                results += `Horizontal spacing: ${hSpacing.toFixed(3)} pixels<br>`;
+            } else {
+                results += 'Horizontal spacing: Could not determine<br>';
+            }
+            
+            if (vSpacing !== undefined && vSpacing !== null) {
+                results += `Vertical spacing: ${vSpacing.toFixed(3)} pixels<br>`;
+            } else {
+                results += 'Vertical spacing: Could not determine<br>';
+            }
+            
+            document.getElementById('analysisResults').innerHTML = results;
+            console.log('Spacing analysis completed:', { horizontal: hSpacing, vertical: vSpacing });
+        }
+        
+        // Event listeners
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            if (e.target.files.length > 0) {
+                loadImageToCanvas(e.target.files[0]);
+            }
+        });
+        
+        document.getElementById('detectEdges').addEventListener('click', detectEdges);
+        document.getElementById('createProfiles').addEventListener('click', createProfiles);
+        document.getElementById('findPeaks').addEventListener('click', findPeaks);
+        document.getElementById('calculateSpacing').addEventListener('click', calculateSpacing);
+        
+        // Initialize WASM when page loads
+        initWasm().catch(console.error);
+    </script>
+    
+    <noscript>
+        <p>This demo requires JavaScript to be enabled.</p>
+    </noscript>
+</body>
+</html>

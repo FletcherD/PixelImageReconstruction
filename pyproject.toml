@@ -1,0 +1,26 @@
+[project]
+name = "pixelimagereconstruction"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "datasets>=3.1.0",
+    "ipympl>=0.9.7",
+    "ipywidgets>=8.1.7",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.3",
+    "numpy>=2.3.0",
+    "opencv-python>=4.11.0.86",
+    "pillow>=11.2.1",
+    "plotly>=6.1.2",
+    "scikit-image>=0.25.2",
+    "scikit-learn>=1.7.0",
+    "scipy>=1.15.3",
+    "standard-imghdr>=3.13.0",
+    "tensorboard>=2.19.0",
+    "tensorboard-plugin-profile>=2.20.0",
+    "torch>=2.7.1",
+    "torchvision>=0.22.1",
+    "wandb>=0.20.1",
+]
