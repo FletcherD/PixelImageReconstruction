@@ -21,7 +21,7 @@ from tqdm import tqdm
 import wandb
 
 # Import our modules
-from compact_unet import CompactUNet, CompactUNetGAP, count_parameters
+from compact_unet import CompactUNet, CompactUNetGAP, count_parameters, heteroscedastic_loss
 from data_synthesis_pipeline import (
     PixelArtDataSynthesizer, 
     PixelArtDataset, 
@@ -49,36 +49,6 @@ def get_device():
         return torch.device('cpu')
 
 
-class PixelLoss(nn.Module):
-    """Custom loss function for pixel prediction."""
-    
-    def __init__(self, loss_type: str = 'mse', color_weight: float = 1.0):
-        super().__init__()
-        self.loss_type = loss_type
-        self.color_weight = color_weight
-        
-        if loss_type == 'mse':
-            self.base_loss = nn.MSELoss()
-        elif loss_type == 'l1':
-            self.base_loss = nn.L1Loss()
-        elif loss_type == 'smooth_l1':
-            self.base_loss = nn.SmoothL1Loss()
-        else:
-            raise ValueError(f"Unknown loss type: {loss_type}")
-    
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Basic pixel loss
-        pixel_loss = self.base_loss(pred, target)
-        
-        # Optional: Add color consistency loss
-        if self.color_weight > 0:
-            # Encourage color consistency across channels
-            pred_mean = pred.mean(dim=1, keepdim=True)
-            target_mean = target.mean(dim=1, keepdim=True)
-            color_loss = self.base_loss(pred_mean, target_mean)
-            pixel_loss = pixel_loss + self.color_weight * color_loss
-        
-        return pixel_loss
 
 
 def create_datasets(args) -> tuple:
@@ -144,7 +114,7 @@ def create_datasets(args) -> tuple:
     return train_dataset, val_dataset
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch: int) -> Dict[str, float]:
+def train_epoch(model, dataloader, optimizer, device, epoch: int) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
@@ -156,8 +126,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch: int) -> 
         inputs, targets = inputs.to(device), targets.to(device)
         
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        mu, sigma_sq = model(inputs)
+        loss = heteroscedastic_loss(mu, sigma_sq, targets)
         loss.backward()
         optimizer.step()
         
@@ -177,27 +147,31 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch: int) -> 
     return {'train_loss': total_loss / num_batches}
 
 
-def validate_epoch(model, dataloader, criterion, device, epoch: int) -> Dict[str, float]:
+def validate_epoch(model, dataloader, device, epoch: int) -> Dict[str, float]:
     """Validate for one epoch."""
     model.eval()
     total_loss = 0.0
     total_mae = 0.0
+    total_uncertainty = 0.0
     num_batches = len(dataloader)
     
     with torch.no_grad():
         for inputs, targets in tqdm(dataloader, desc=f'Val {epoch}'):
             inputs, targets = inputs.to(device), targets.to(device)
             
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            mae = torch.abs(outputs - targets).mean()
+            mu, sigma_sq = model(inputs)
+            loss = heteroscedastic_loss(mu, sigma_sq, targets)
+            mae = torch.abs(mu - targets).mean()
+            uncertainty = sigma_sq.mean()
             
             total_loss += loss.item()
             total_mae += mae.item()
+            total_uncertainty += uncertainty.item()
     
     return {
         'val_loss': total_loss / num_batches,
-        'val_mae': total_mae / num_batches
+        'val_mae': total_mae / num_batches,
+        'val_uncertainty': total_uncertainty / num_batches
     }
 
 
@@ -261,12 +235,6 @@ def main():
                        choices=['sigmoid', 'tanh', 'none'],
                        help='Final activation function')
     
-    # Loss arguments
-    parser.add_argument('--loss_type', type=str, default='mse',
-                       choices=['mse', 'l1', 'smooth_l1'],
-                       help='Loss function type')
-    parser.add_argument('--color_weight', type=float, default=0.0,
-                       help='Weight for color consistency loss')
     
     # Training setup
     parser.add_argument('--seed', type=int, default=42,
@@ -342,8 +310,7 @@ def main():
     model = model.to(device)
     print(f"Model parameters: {count_parameters(model):,}")
     
-    # Create loss function and optimizer
-    criterion = PixelLoss(args.loss_type, args.color_weight)
+    # Create optimizer (using heteroscedastic_loss function directly)
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
     # Learning rate scheduler
@@ -360,10 +327,10 @@ def main():
     
     for epoch in range(1, args.epochs + 1):
         # Train
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
+        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch)
         
         # Validate
-        val_metrics = validate_epoch(model, val_loader, criterion, device, epoch)
+        val_metrics = validate_epoch(model, val_loader, device, epoch)
         
         # Update learning rate
         scheduler.step(val_metrics['val_loss'])
@@ -372,7 +339,8 @@ def main():
         metrics = {**train_metrics, **val_metrics, 'epoch': epoch, 'lr': optimizer.param_groups[0]['lr']}
         
         print(f"Epoch {epoch}: Train Loss: {train_metrics['train_loss']:.6f}, "
-              f"Val Loss: {val_metrics['val_loss']:.6f}, Val MAE: {val_metrics['val_mae']:.6f}")
+              f"Val Loss: {val_metrics['val_loss']:.6f}, Val MAE: {val_metrics['val_mae']:.6f}, "
+              f"Val Uncertainty: {val_metrics['val_uncertainty']:.6f}")
         
         if not args.disable_wandb:
             wandb.log(metrics)

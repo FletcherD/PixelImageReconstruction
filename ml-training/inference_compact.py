@@ -151,6 +151,8 @@ def mc_dropout_inference_single_patch(model: torch.nn.Module, patch_tensor: torc
                                     n_samples: int = 10) -> tuple:
     """
     Perform Monte Carlo dropout inference on a single patch.
+    Note: With heteroscedastic models, this samples the mu outputs to estimate epistemic uncertainty,
+    while the model's sigma_sq represents aleatoric uncertainty.
     
     Args:
         model: Trained CompactUNet model
@@ -160,31 +162,40 @@ def mc_dropout_inference_single_patch(model: torch.nn.Module, patch_tensor: torc
     Returns:
         Tuple of (mean_prediction, uncertainty_map)
     """
-    predictions = []
+    mu_predictions = []
+    sigma_sq_predictions = []
     
     # Enable dropout for Monte Carlo sampling
     enable_dropout(model)
     
     with torch.no_grad():
         for _ in range(n_samples):
-            pred = model(patch_tensor)
-            predictions.append(pred.cpu().numpy())
+            mu, sigma_sq = model(patch_tensor)
+            mu_predictions.append(mu.cpu().numpy())
+            sigma_sq_predictions.append(sigma_sq.cpu().numpy())
     
     # Disable dropout after sampling
     disable_dropout(model)
     
-    # Convert to numpy array: (n_samples, 1, 3, 32, 32)
-    predictions = np.array(predictions)
+    # Convert to numpy arrays: (n_samples, 1, 3, 32, 32)
+    mu_predictions = np.array(mu_predictions)
+    sigma_sq_predictions = np.array(sigma_sq_predictions)
     
-    # Calculate mean and variance across samples
-    mean_pred = np.mean(predictions, axis=0)  # (1, 3, 32, 32)
-    var_pred = np.var(predictions, axis=0)    # (1, 3, 32, 32)
+    # Calculate mean across samples for mu (epistemic uncertainty)
+    mean_mu = np.mean(mu_predictions, axis=0)  # (1, 3, 32, 32)
+    var_mu = np.var(mu_predictions, axis=0)    # (1, 3, 32, 32) - epistemic uncertainty
     
-    return mean_pred, var_pred
+    # Average the predicted aleatoric uncertainty (sigma_sq)
+    mean_sigma_sq = np.mean(sigma_sq_predictions, axis=0)  # (1, 3, 32, 32)
+    
+    # Total uncertainty = epistemic + aleatoric
+    total_uncertainty = var_mu + mean_sigma_sq
+    
+    return mean_mu, total_uncertainty
 
 
 def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                        patch_size: int = 32, window_size: int = 128) -> np.ndarray:
+                        patch_size: int = 32, window_size: int = 128) -> tuple:
     """
     Perform tile-based inference on the input image.
     
@@ -196,7 +207,7 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
         window_size: Size of input window (128x128)
     
     Returns:
-        Reconstructed image as numpy array (1/4 resolution of input)
+        Tuple of (mean_output, variance_output) both at 1/4 resolution of input
     """
     # Input stride is the window size for 1/4 resolution output
     input_stride = window_size
@@ -209,14 +220,15 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
     num_tiles_y = padded_height // input_stride
     num_tiles_x = padded_width // input_stride
     
-    # Initialize output array (1/4 resolution)
+    # Initialize output arrays (1/4 resolution)
     output_height = padded_height // 4
     output_width = padded_width // 4
-    output = np.zeros((output_height, output_width, channels), dtype=np.float32)
+    mean_output = np.zeros((output_height, output_width, channels), dtype=np.float32)
+    variance_output = np.zeros((output_height, output_width, channels), dtype=np.float32)
     
     print(f"Input image shape: {image.shape}")
     print(f"Padded image shape: {padded_image.shape}")
-    print(f"Output image shape: {output.shape}")
+    print(f"Output image shape: {mean_output.shape}")
     print(f"Number of tiles: {num_tiles_y} x {num_tiles_x} = {num_tiles_y * num_tiles_x}")
     print(f"Patch size: {patch_size}x{patch_size}, Window size: {window_size}x{window_size}")
     print(f"Input stride: {input_stride}x{input_stride}")
@@ -241,19 +253,20 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
                 patch_tensor = preprocess_patch(input_patch).to(device)
                 
                 # Get model prediction (32x32 patch)
-                prediction = model(patch_tensor)
+                mu, sigma_sq = model(patch_tensor)
                 
-                # Convert prediction back to numpy
-                # prediction shape: (1, 3, 32, 32)
-                patch_output = prediction.squeeze(0).cpu().numpy()  # (3, 32, 32)
-                patch_output = patch_output.transpose(1, 2, 0)      # (32, 32, 3)
+                # Convert predictions back to numpy
+                # mu and sigma_sq shapes: (1, 3, 32, 32)
+                patch_mean = mu.squeeze(0).cpu().numpy().transpose(1, 2, 0)      # (32, 32, 3)
+                patch_variance = sigma_sq.squeeze(0).cpu().numpy().transpose(1, 2, 0)  # (32, 32, 3)
                 
-                # Store in output array (coordinates in output space)
+                # Store in output arrays (coordinates in output space)
                 output_y_start = tile_y * patch_size
                 output_x_start = tile_x * patch_size
                 output_y_end = output_y_start + patch_size
                 output_x_end = output_x_start + patch_size
-                output[output_y_start:output_y_end, output_x_start:output_x_end, :] = patch_output
+                mean_output[output_y_start:output_y_end, output_x_start:output_x_end, :] = patch_mean
+                variance_output[output_y_start:output_y_end, output_x_start:output_x_end, :] = patch_variance
                 
                 # Progress indicator
                 tiles_done = tile_y * num_tiles_x + tile_x + 1
@@ -266,9 +279,10 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
     orig_height, orig_width, _ = padding_info['original_shape']
     orig_output_height = orig_height // 4
     orig_output_width = orig_width // 4
-    output = output[:orig_output_height, :orig_output_width, :]
+    mean_output = mean_output[:orig_output_height, :orig_output_width, :]
+    variance_output = variance_output[:orig_output_height, :orig_output_width, :]
     
-    return output
+    return mean_output, variance_output
 
 
 def tile_based_inference_mc_dropout(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
@@ -366,7 +380,7 @@ def tile_based_inference_mc_dropout(image: np.ndarray, model: torch.nn.Module, d
 
 
 def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                        patch_size: int = 32, window_size: int = 128, batch_size: int = 16) -> np.ndarray:
+                        patch_size: int = 32, window_size: int = 128, batch_size: int = 16) -> tuple:
     """
     Perform batched tile-based inference for better GPU utilization.
     
@@ -379,7 +393,7 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
         batch_size: Number of tiles to process in parallel
     
     Returns:
-        Reconstructed image as numpy array (1/4 resolution of input)
+        Tuple of (mean_output, variance_output) both at 1/4 resolution of input
     """
     # Input stride is the window size for 1/4 resolution output
     input_stride = window_size
@@ -393,14 +407,15 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
     num_tiles_x = padded_width // input_stride
     total_tiles = num_tiles_y * num_tiles_x
     
-    # Initialize output array (1/4 resolution)
+    # Initialize output arrays (1/4 resolution)
     output_height = padded_height // 4
     output_width = padded_width // 4
-    output = np.zeros((output_height, output_width, channels), dtype=np.float32)
+    mean_output = np.zeros((output_height, output_width, channels), dtype=np.float32)
+    variance_output = np.zeros((output_height, output_width, channels), dtype=np.float32)
     
     print(f"Input image shape: {image.shape}")
     print(f"Padded image shape: {padded_image.shape}")
-    print(f"Output image shape: {output.shape}")
+    print(f"Output image shape: {mean_output.shape}")
     print(f"Number of tiles: {num_tiles_y} x {num_tiles_x} = {total_tiles}")
     print(f"Patch size: {patch_size}x{patch_size}, Window size: {window_size}x{window_size}")
     print(f"Input stride: {input_stride}x{input_stride}")
@@ -437,19 +452,20 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
             ]).to(device)
             
             # Get model predictions
-            predictions = model(batch_tensor)  # (batch_size, 3, 32, 32)
+            mu_batch, sigma_sq_batch = model(batch_tensor)  # Each: (batch_size, 3, 32, 32)
             
             # Store results
             for idx, (tile_y, tile_x) in enumerate(batch_coords):
-                patch_output = predictions[idx].cpu().numpy()    # (3, 32, 32)
-                patch_output = patch_output.transpose(1, 2, 0)   # (32, 32, 3)
+                patch_mean = mu_batch[idx].cpu().numpy().transpose(1, 2, 0)      # (32, 32, 3)
+                patch_variance = sigma_sq_batch[idx].cpu().numpy().transpose(1, 2, 0)  # (32, 32, 3)
                 
-                # Store in output array (coordinates in output space)
+                # Store in output arrays (coordinates in output space)
                 output_y_start = tile_y * patch_size
                 output_x_start = tile_x * patch_size
                 output_y_end = output_y_start + patch_size
                 output_x_end = output_x_start + patch_size
-                output[output_y_start:output_y_end, output_x_start:output_x_end, :] = patch_output
+                mean_output[output_y_start:output_y_end, output_x_start:output_x_end, :] = patch_mean
+                variance_output[output_y_start:output_y_end, output_x_start:output_x_end, :] = patch_variance
             
             # Progress indicator
             progress = batch_end / len(tiles) * 100
@@ -459,9 +475,10 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
     orig_height, orig_width, _ = padding_info['original_shape']
     orig_output_height = orig_height // 4
     orig_output_width = orig_width // 4
-    output = output[:orig_output_height, :orig_output_width, :]
+    mean_output = mean_output[:orig_output_height, :orig_output_width, :]
+    variance_output = variance_output[:orig_output_height, :orig_output_width, :]
     
-    return output
+    return mean_output, variance_output
 
 
 def postprocess_output(output: np.ndarray) -> np.ndarray:
@@ -488,6 +505,7 @@ def main():
     parser.add_argument('--mc-dropout', action='store_true', help='Use Monte Carlo dropout for uncertainty estimation')
     parser.add_argument('--mc-samples', type=int, default=10, help='Number of Monte Carlo dropout samples (default: 10)')
     parser.add_argument('--uncertainty-output', type=str, help='Path to save uncertainty map (default: input_uncertainty.png)')
+    parser.add_argument('--variance-output', type=str, help='Path to save variance map from heteroscedastic model (default: input_variance.png)')
     
     args = parser.parse_args()
     
@@ -531,17 +549,18 @@ def main():
     else:
         print("Starting patch-based inference...")
         if args.use_batched:
-            output = batch_tile_inference(image_array, model, device, 
+            mean_output, variance_output = batch_tile_inference(image_array, model, device, 
                                         patch_size=args.patch_size, 
                                         window_size=args.window_size,
                                         batch_size=args.batch_size)
         else:
-            output = tile_based_inference(image_array, model, device, 
+            mean_output, variance_output = tile_based_inference(image_array, model, device, 
                                         patch_size=args.patch_size, 
                                         window_size=args.window_size)
         
-        # Postprocess output
-        output_image = postprocess_output(output)
+        # Postprocess outputs
+        output_image = postprocess_output(mean_output)
+        variance_image = postprocess_output(np.sqrt(variance_output))  # Standard deviation
         uncertainty_image = None
     
     # Save output
@@ -565,6 +584,17 @@ def main():
         Image.fromarray(uncertainty_image).save(uncertainty_path)
         print(f"Uncertainty map saved to: {uncertainty_path}")
     
+    # Save variance map from heteroscedastic model
+    if not args.mc_dropout and 'variance_image' in locals():
+        if args.variance_output is None:
+            input_path = Path(args.input_image)
+            variance_path = input_path.parent / f"{input_path.stem}_variance{input_path.suffix}"
+        else:
+            variance_path = Path(args.variance_output)
+        
+        Image.fromarray(variance_image).save(variance_path)
+        print(f"Variance map saved to: {variance_path}")
+    
     # Print statistics
     print(f"\nStatistics:")
     print(f"Input resolution: {image_array.shape[1]}x{image_array.shape[0]}")
@@ -580,6 +610,13 @@ def main():
             print(f"  Mean: {np.mean(uncertainty_stats):.4f}")
             print(f"  Min: {np.min(uncertainty_stats):.4f}")
             print(f"  Max: {np.max(uncertainty_stats):.4f}")
+    else:
+        if 'variance_output' in locals():
+            variance_stats = np.sqrt(variance_output)
+            print(f"Heteroscedastic variance statistics (std dev):")
+            print(f"  Mean: {np.mean(variance_stats):.4f}")
+            print(f"  Min: {np.min(variance_stats):.4f}")
+            print(f"  Max: {np.max(variance_stats):.4f}")
 
 
 if __name__ == "__main__":

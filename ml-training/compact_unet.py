@@ -123,8 +123,8 @@ class CompactUNet(nn.Module):
         # 16x16 → 32x32 (with skip from enc3: 64 channels)
         self.dec3 = DecoderBlock(128, 64, 64, dropout=dropout, use_transpose=use_transpose)
         
-        # Final output layer
-        self.final_conv = nn.Conv2d(64, out_channels, 1)
+        # Final output layer - outputs 2x channels (mu + sigma^2)
+        self.final_conv = nn.Conv2d(64, out_channels * 2, 1)
     
     def forward(self, x):
         # Encoder path
@@ -141,16 +141,21 @@ class CompactUNet(nn.Module):
         x = self.dec3(x, skip3)     # 16x16 → 32x32, concat with skip3
         
         # Final convolution
-        x = self.final_conv(x)      # 32x32x3
+        x = self.final_conv(x)      # 32x32x6 (3 for mu, 3 for sigma^2)
         
-        # Final activation
+        # Split into mu and sigma^2
+        mu, log_var = torch.chunk(x, 2, dim=1)  # Each: 32x32x3
+        
+        # Apply activations
         if self.final_activation == 'sigmoid':
-            x = torch.sigmoid(x)
+            mu = torch.sigmoid(mu)
         elif self.final_activation == 'tanh':
-            x = torch.tanh(x)
-        # If 'none', return raw logits
+            mu = torch.tanh(mu)
         
-        return x
+        # Ensure variance is positive using softplus
+        sigma_sq = F.softplus(log_var) + 1e-6  # Add small epsilon for numerical stability
+        
+        return mu, sigma_sq
 
 
 class CompactUNetGAP(nn.Module):
@@ -185,7 +190,7 @@ class CompactUNetGAP(nn.Module):
             nn.Dropout2d(dropout),
             nn.Conv2d(128, 64, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 32*32*out_channels, 1)  # Predict flattened 32x32 patch
+            nn.Conv2d(64, 32*32*out_channels*2, 1)  # Predict flattened 32x32 patch (mu + sigma^2)
         )
     
     def forward(self, x):
@@ -202,23 +207,50 @@ class CompactUNetGAP(nn.Module):
         
         # Global Average Pooling + MLP
         x = self.gap(x)         # 1x1x256
-        x = self.mlp(x)         # 1x1x(32*32*3)
+        x = self.mlp(x)         # 1x1x(32*32*6)
         
         # Reshape to 32x32 patch
-        x = x.view(batch_size, 3, 32, 32)  # Shape: (batch_size, 3, 32, 32)
+        x = x.view(batch_size, 6, 32, 32)  # Shape: (batch_size, 6, 32, 32)
         
-        # Final activation
+        # Split into mu and sigma^2
+        mu, log_var = torch.chunk(x, 2, dim=1)  # Each: (batch_size, 3, 32, 32)
+        
+        # Apply activations
         if self.final_activation == 'sigmoid':
-            x = torch.sigmoid(x)
+            mu = torch.sigmoid(mu)
         elif self.final_activation == 'tanh':
-            x = torch.tanh(x)
+            mu = torch.tanh(mu)
         
-        return x
+        # Ensure variance is positive using softplus
+        sigma_sq = F.softplus(log_var) + 1e-6  # Add small epsilon for numerical stability
+        
+        return mu, sigma_sq
 
 
 def count_parameters(model):
     """Count the number of trainable parameters in the model."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def heteroscedastic_loss(mu, sigma_sq, target):
+    """
+    Heteroscedastic loss function for uncertainty-aware training.
+    
+    Args:
+        mu: Predicted mean values (B, C, H, W)
+        sigma_sq: Predicted variance values (B, C, H, W)
+        target: Ground truth values (B, C, H, W)
+    
+    Returns:
+        Loss value
+    """
+    # Negative log-likelihood for Gaussian distribution
+    # L = 0.5 * (log(2π) + log(σ²) + (y - μ)² / σ²)
+    # We omit the constant log(2π) term
+    reconstruction_loss = (target - mu) ** 2
+    uncertainty_loss = 0.5 * (torch.log(sigma_sq) + reconstruction_loss / sigma_sq)
+    
+    return torch.mean(uncertainty_loss)
 
 
 def test_model():
@@ -231,20 +263,27 @@ def test_model():
     print(f"CompactUNet parameters: {count_parameters(model):,}")
     
     with torch.no_grad():
-        output = model(x)
+        mu, sigma_sq = model(x)
     
-    print(f"Output shape: {output.shape}")
-    print(f"Output range: [{output.min():.3f}, {output.max():.3f}]")
+    print(f"Mu shape: {mu.shape}, Sigma² shape: {sigma_sq.shape}")
+    print(f"Mu range: [{mu.min():.3f}, {mu.max():.3f}]")
+    print(f"Sigma² range: [{sigma_sq.min():.3f}, {sigma_sq.max():.3f}]")
+    
+    # Test loss function
+    target = torch.randn_like(mu)
+    loss = heteroscedastic_loss(mu, sigma_sq, target)
+    print(f"Heteroscedastic loss: {loss:.3f}")
     
     # Test CompactUNetGAP
     model_gap = CompactUNetGAP()
     print(f"\nCompactUNetGAP parameters: {count_parameters(model_gap):,}")
     
     with torch.no_grad():
-        output_gap = model_gap(x)
+        mu_gap, sigma_sq_gap = model_gap(x)
     
-    print(f"GAP output shape: {output_gap.shape}")
-    print(f"GAP output range: [{output_gap.min():.3f}, {output_gap.max():.3f}]")
+    print(f"GAP Mu shape: {mu_gap.shape}, GAP Sigma² shape: {sigma_sq_gap.shape}")
+    print(f"GAP Mu range: [{mu_gap.min():.3f}, {mu_gap.max():.3f}]")
+    print(f"GAP Sigma² range: [{sigma_sq_gap.min():.3f}, {sigma_sq_gap.max():.3f}]")
 
 
 if __name__ == "__main__":
