@@ -127,7 +127,7 @@ def postprocess_output(output: np.ndarray) -> np.ndarray:
 def main():
     parser = argparse.ArgumentParser(description='Sliding window inference for pixel reconstruction')
     parser.add_argument('input_image', type=str, help='Path to input image')
-    parser.add_argument('--model', type=str, default='ml-training/checkpoints/best_model.pth',
+    parser.add_argument('--model', type=str, default='checkpoints-33-128/final_model.pth',
                        help='Path to model checkpoint')
     parser.add_argument('--output', type=str, help='Output image path (default: input_reconstructed.png)')
     parser.add_argument('--use-gap', action='store_true', help='Use GAP variant of the model')
