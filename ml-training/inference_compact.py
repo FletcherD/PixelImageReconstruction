@@ -50,22 +50,22 @@ def preprocess_patch(patch: np.ndarray) -> torch.Tensor:
     return patch_tensor
 
 
-def pad_image_for_reconstruction(image: np.ndarray, patch_size: int = 32) -> tuple:
+def pad_image_for_reconstruction(image: np.ndarray, input_stride: int = 128) -> tuple:
     """
-    Pad image to make dimensions divisible by patch_size.
+    Pad image to make dimensions divisible by input_stride.
     
     Args:
         image: Input image as numpy array (H, W, C)
-        patch_size: Size of output patches (32x32)
+        input_stride: Size of input stride (128x128) for 1/4 resolution output
     
     Returns:
         Tuple of (padded_image, padding_info)
     """
     height, width, channels = image.shape
     
-    # Calculate padding needed to make dimensions divisible by patch_size
-    pad_height = (patch_size - height % patch_size) % patch_size
-    pad_width = (patch_size - width % patch_size) % patch_size
+    # Calculate padding needed to make dimensions divisible by input_stride
+    pad_height = (input_stride - height % input_stride) % input_stride
+    pad_width = (input_stride - width % input_stride) % input_stride
     
     # Pad the image
     padded_image = np.pad(image, 
@@ -146,34 +146,41 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
         window_size: Size of input window (128x128)
     
     Returns:
-        Reconstructed image as numpy array
+        Reconstructed image as numpy array (1/4 resolution of input)
     """
-    # Pad image to handle edge cases and make dimensions divisible
-    padded_image, padding_info = pad_image_for_reconstruction(image, patch_size)
+    # Input stride is the window size for 1/4 resolution output
+    input_stride = window_size
+    
+    # Pad image to handle edge cases and make dimensions divisible by input stride
+    padded_image, padding_info = pad_image_for_reconstruction(image, input_stride)
     padded_height, padded_width, channels = padded_image.shape
     
-    # Calculate number of tiles
-    num_tiles_y = padded_height // patch_size
-    num_tiles_x = padded_width // patch_size
+    # Calculate number of tiles based on input stride
+    num_tiles_y = padded_height // input_stride
+    num_tiles_x = padded_width // input_stride
     
-    # Initialize output array
-    output = np.zeros((padded_height, padded_width, channels), dtype=np.float32)
+    # Initialize output array (1/4 resolution)
+    output_height = padded_height // 4
+    output_width = padded_width // 4
+    output = np.zeros((output_height, output_width, channels), dtype=np.float32)
     
     print(f"Input image shape: {image.shape}")
     print(f"Padded image shape: {padded_image.shape}")
+    print(f"Output image shape: {output.shape}")
     print(f"Number of tiles: {num_tiles_y} x {num_tiles_x} = {num_tiles_y * num_tiles_x}")
     print(f"Patch size: {patch_size}x{patch_size}, Window size: {window_size}x{window_size}")
+    print(f"Input stride: {input_stride}x{input_stride}")
     
     with torch.no_grad():
         for tile_y in range(num_tiles_y):
             for tile_x in range(num_tiles_x):
-                # Calculate tile coordinates
-                y_start = tile_y * patch_size
-                x_start = tile_x * patch_size
+                # Calculate input tile coordinates (stride by window_size)
+                input_y_start = tile_y * input_stride
+                input_x_start = tile_x * input_stride
                 
-                # Extract 128x128 input patch centered on this 32x32 tile
-                input_patch = extract_input_patch(padded_image, y_start, x_start, 
-                                                patch_size, window_size)
+                # Extract 128x128 input patch
+                input_patch = padded_image[input_y_start:input_y_start + window_size,
+                                         input_x_start:input_x_start + window_size, :]
                 
                 # Ensure patch is the right size
                 if input_patch.shape[:2] != (window_size, window_size):
@@ -191,10 +198,12 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
                 patch_output = prediction.squeeze(0).cpu().numpy()  # (3, 32, 32)
                 patch_output = patch_output.transpose(1, 2, 0)      # (32, 32, 3)
                 
-                # Store in output array
-                y_end = y_start + patch_size
-                x_end = x_start + patch_size
-                output[y_start:y_end, x_start:x_end, :] = patch_output
+                # Store in output array (coordinates in output space)
+                output_y_start = tile_y * patch_size
+                output_x_start = tile_x * patch_size
+                output_y_end = output_y_start + patch_size
+                output_x_end = output_x_start + patch_size
+                output[output_y_start:output_y_end, output_x_start:output_x_end, :] = patch_output
                 
                 # Progress indicator
                 tiles_done = tile_y * num_tiles_x + tile_x + 1
@@ -203,9 +212,11 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
                     progress = tiles_done / total_tiles * 100
                     print(f"Progress: {progress:.1f}% ({tiles_done}/{total_tiles} tiles)")
     
-    # Remove padding to get back to original dimensions
+    # Remove padding to get back to original dimensions (1/4 scale)
     orig_height, orig_width, _ = padding_info['original_shape']
-    output = output[:orig_height, :orig_width, :]
+    orig_output_height = orig_height // 4
+    orig_output_width = orig_width // 4
+    output = output[:orig_output_height, :orig_output_width, :]
     
     return output
 
@@ -224,24 +235,31 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
         batch_size: Number of tiles to process in parallel
     
     Returns:
-        Reconstructed image as numpy array
+        Reconstructed image as numpy array (1/4 resolution of input)
     """
-    # Pad image to handle edge cases and make dimensions divisible
-    padded_image, padding_info = pad_image_for_reconstruction(image, patch_size)
+    # Input stride is the window size for 1/4 resolution output
+    input_stride = window_size
+    
+    # Pad image to handle edge cases and make dimensions divisible by input stride
+    padded_image, padding_info = pad_image_for_reconstruction(image, input_stride)
     padded_height, padded_width, channels = padded_image.shape
     
-    # Calculate number of tiles
-    num_tiles_y = padded_height // patch_size
-    num_tiles_x = padded_width // patch_size
+    # Calculate number of tiles based on input stride
+    num_tiles_y = padded_height // input_stride
+    num_tiles_x = padded_width // input_stride
     total_tiles = num_tiles_y * num_tiles_x
     
-    # Initialize output array
-    output = np.zeros((padded_height, padded_width, channels), dtype=np.float32)
+    # Initialize output array (1/4 resolution)
+    output_height = padded_height // 4
+    output_width = padded_width // 4
+    output = np.zeros((output_height, output_width, channels), dtype=np.float32)
     
     print(f"Input image shape: {image.shape}")
     print(f"Padded image shape: {padded_image.shape}")
+    print(f"Output image shape: {output.shape}")
     print(f"Number of tiles: {num_tiles_y} x {num_tiles_x} = {total_tiles}")
     print(f"Patch size: {patch_size}x{patch_size}, Window size: {window_size}x{window_size}")
+    print(f"Input stride: {input_stride}x{input_stride}")
     print(f"Batch size: {batch_size}")
     
     # Collect all tiles and coordinates
@@ -250,16 +268,17 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
     
     for tile_y in range(num_tiles_y):
         for tile_x in range(num_tiles_x):
-            y_start = tile_y * patch_size
-            x_start = tile_x * patch_size
+            # Calculate input tile coordinates (stride by window_size)
+            input_y_start = tile_y * input_stride
+            input_x_start = tile_x * input_stride
             
             # Extract 128x128 input patch
-            input_patch = extract_input_patch(padded_image, y_start, x_start, 
-                                            patch_size, window_size)
+            input_patch = padded_image[input_y_start:input_y_start + window_size,
+                                     input_x_start:input_x_start + window_size, :]
             
             if input_patch.shape[:2] == (window_size, window_size):
                 tiles.append(input_patch)
-                coordinates.append((y_start, x_start))
+                coordinates.append((tile_y, tile_x))
     
     # Process tiles in batches
     with torch.no_grad():
@@ -277,21 +296,26 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
             predictions = model(batch_tensor)  # (batch_size, 3, 32, 32)
             
             # Store results
-            for idx, (y_start, x_start) in enumerate(batch_coords):
+            for idx, (tile_y, tile_x) in enumerate(batch_coords):
                 patch_output = predictions[idx].cpu().numpy()    # (3, 32, 32)
                 patch_output = patch_output.transpose(1, 2, 0)   # (32, 32, 3)
                 
-                y_end = y_start + patch_size
-                x_end = x_start + patch_size
-                output[y_start:y_end, x_start:x_end, :] = patch_output
+                # Store in output array (coordinates in output space)
+                output_y_start = tile_y * patch_size
+                output_x_start = tile_x * patch_size
+                output_y_end = output_y_start + patch_size
+                output_x_end = output_x_start + patch_size
+                output[output_y_start:output_y_end, output_x_start:output_x_end, :] = patch_output
             
             # Progress indicator
             progress = batch_end / len(tiles) * 100
             print(f"Progress: {progress:.1f}% ({batch_end}/{len(tiles)} tiles)")
     
-    # Remove padding to get back to original dimensions
+    # Remove padding to get back to original dimensions (1/4 scale)
     orig_height, orig_width, _ = padding_info['original_shape']
-    output = output[:orig_height, :orig_width, :]
+    orig_output_height = orig_height // 4
+    orig_output_width = orig_width // 4
+    output = output[:orig_output_height, :orig_output_width, :]
     
     return output
 
