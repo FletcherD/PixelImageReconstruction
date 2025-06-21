@@ -94,7 +94,9 @@ def create_datasets(args) -> tuple:
             num_samples=args.hf_samples,
             synthesizer=synthesizer,
             split='train',
-            streaming=args.hf_streaming
+            streaming=args.hf_streaming,
+            crop_size=32,
+            input_size=128
         )
         datasets.append(hf_dataset)
     
@@ -104,7 +106,9 @@ def create_datasets(args) -> tuple:
         local_dataset = PixelArtDataset(
             source_images_dir=args.source_images_dir,
             num_samples=args.local_samples,
-            synthesizer=synthesizer
+            synthesizer=synthesizer,
+            crop_size=32,
+            input_size=128
         )
         datasets.append(local_dataset)
     
