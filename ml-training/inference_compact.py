@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Sliding window inference script for pixel reconstruction using CompactUNet.
+Patch-based inference script for image reconstruction using CompactUNet.
 
 Takes a large image and reconstructs it using the trained CompactUNet model.
-The model takes 129x129 patches and outputs 1x1 pixels (center pixel prediction).
-Sliding window moves 1 pixel at a time for dense reconstruction.
+The model takes 132x132 patches and outputs 32x32 patches.
+Uses non-overlapping 32x32 windows for efficient reconstruction.
 """
 
 import torch
@@ -50,177 +50,248 @@ def preprocess_patch(patch: np.ndarray) -> torch.Tensor:
     return patch_tensor
 
 
-def pad_image_for_inference(image: np.ndarray, window_size: int = 129) -> tuple:
+def pad_image_for_reconstruction(image: np.ndarray, patch_size: int = 32) -> tuple:
     """
-    Pad image to ensure all pixels can be reconstructed.
+    Pad image to make dimensions divisible by patch_size.
     
     Args:
         image: Input image as numpy array (H, W, C)
-        window_size: Size of input window (129x129)
+        patch_size: Size of output patches (32x32)
     
     Returns:
         Tuple of (padded_image, padding_info)
     """
     height, width, channels = image.shape
     
-    # Calculate padding needed
-    pad_size = window_size // 2  # 64 pixels on each side
+    # Calculate padding needed to make dimensions divisible by patch_size
+    pad_height = (patch_size - height % patch_size) % patch_size
+    pad_width = (patch_size - width % patch_size) % patch_size
     
     # Pad the image
     padded_image = np.pad(image, 
-                         ((pad_size, pad_size), (pad_size, pad_size), (0, 0)), 
+                         ((0, pad_height), (0, pad_width), (0, 0)), 
                          mode='reflect')
     
     padding_info = {
-        'pad_size': pad_size,
+        'pad_height': pad_height,
+        'pad_width': pad_width,
         'original_shape': (height, width, channels)
     }
     
     return padded_image, padding_info
 
 
-def sliding_window_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                           window_size: int = 129, stride: int = 1) -> np.ndarray:
+def extract_input_patch(image: np.ndarray, i: int, j: int, 
+                       patch_size: int = 32, window_size: int = 132) -> np.ndarray:
     """
-    Perform sliding window inference on the input image.
+    Extract 132x132 input patch centered on 32x32 output region.
+    
+    Args:
+        image: Input image
+        i, j: Top-left coordinates of 32x32 output region
+        patch_size: Size of output patch (32)
+        window_size: Size of input window (132)
+    
+    Returns:
+        132x132 input patch
+    """
+    # Calculate center of 32x32 region
+    center_y = i + patch_size // 2
+    center_x = j + patch_size // 2
+    
+    # Calculate 132x132 window coordinates
+    half_window = window_size // 2
+    y_start = center_y - half_window
+    y_end = center_y + half_window
+    x_start = center_x - half_window  
+    x_end = center_x + half_window
+    
+    # Handle edge cases with padding
+    height, width = image.shape[:2]
+    
+    # Create padded coordinates
+    pad_top = max(0, -y_start)
+    pad_bottom = max(0, y_end - height)
+    pad_left = max(0, -x_start)
+    pad_right = max(0, x_end - width)
+    
+    # Adjust coordinates to valid range
+    y_start = max(0, y_start)
+    y_end = min(height, y_end)
+    x_start = max(0, x_start)
+    x_end = min(width, x_end)
+    
+    # Extract patch
+    patch = image[y_start:y_end, x_start:x_end, :]
+    
+    # Apply padding if needed
+    if pad_top > 0 or pad_bottom > 0 or pad_left > 0 or pad_right > 0:
+        patch = np.pad(patch, 
+                      ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), 
+                      mode='reflect')
+    
+    return patch
+
+
+def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
+                        patch_size: int = 32, window_size: int = 132) -> np.ndarray:
+    """
+    Perform tile-based inference on the input image.
     
     Args:
         image: Input image as numpy array (H, W, C)
         model: Trained CompactUNet model
         device: PyTorch device
-        window_size: Size of input window (129x129)
-        stride: Step size for sliding window (1 pixel for dense reconstruction)
+        patch_size: Size of output patches (32x32)
+        window_size: Size of input window (132x132)
     
     Returns:
         Reconstructed image as numpy array
     """
-    # Pad image to handle edges
-    padded_image, padding_info = pad_image_for_inference(image, window_size)
-    height, width, channels = padded_image.shape
+    # Pad image to handle edge cases and make dimensions divisible
+    padded_image, padding_info = pad_image_for_reconstruction(image, patch_size)
+    padded_height, padded_width, channels = padded_image.shape
     
-    # Calculate output dimensions (same as original image)
-    orig_height, orig_width, _ = padding_info['original_shape']
+    # Calculate number of tiles
+    num_tiles_y = padded_height // patch_size
+    num_tiles_x = padded_width // patch_size
     
     # Initialize output array
-    output = np.zeros((orig_height, orig_width, channels), dtype=np.float32)
+    output = np.zeros((padded_height, padded_width, channels), dtype=np.float32)
     
     print(f"Input image shape: {image.shape}")
     print(f"Padded image shape: {padded_image.shape}")
-    print(f"Output image shape: {output.shape}")
-    print(f"Processing {orig_height * orig_width} patches...")
+    print(f"Number of tiles: {num_tiles_y} x {num_tiles_x} = {num_tiles_y * num_tiles_x}")
+    print(f"Patch size: {patch_size}x{patch_size}, Window size: {window_size}x{window_size}")
     
     with torch.no_grad():
-        for i in range(orig_height):
-            for j in range(orig_width):
-                # Calculate patch coordinates in padded image
-                y_start = i  # No additional offset needed due to padding
-                x_start = j
-                y_end = y_start + window_size
-                x_end = x_start + window_size
+        for tile_y in range(num_tiles_y):
+            for tile_x in range(num_tiles_x):
+                # Calculate tile coordinates
+                y_start = tile_y * patch_size
+                x_start = tile_x * patch_size
                 
-                # Extract patch
-                patch = padded_image[y_start:y_end, x_start:x_end, :]
+                # Extract 132x132 input patch centered on this 32x32 tile
+                input_patch = extract_input_patch(padded_image, y_start, x_start, 
+                                                patch_size, window_size)
                 
                 # Ensure patch is the right size
-                if patch.shape[:2] != (window_size, window_size):
-                    print(f"Warning: Patch at ({i}, {j}) has wrong size: {patch.shape}")
+                if input_patch.shape[:2] != (window_size, window_size):
+                    print(f"Warning: Patch at tile ({tile_y}, {tile_x}) has wrong size: {input_patch.shape}")
                     continue
                 
                 # Preprocess patch
-                patch_tensor = preprocess_patch(patch).to(device)
+                patch_tensor = preprocess_patch(input_patch).to(device)
                 
-                # Get model prediction (center pixel)
+                # Get model prediction (32x32 patch)
                 prediction = model(patch_tensor)
                 
                 # Convert prediction back to numpy
-                # prediction shape: (1, 3, 1, 1)
-                pixel_value = prediction.squeeze().cpu().numpy()
+                # prediction shape: (1, 3, 32, 32)
+                patch_output = prediction.squeeze(0).cpu().numpy()  # (3, 32, 32)
+                patch_output = patch_output.transpose(1, 2, 0)      # (32, 32, 3)
                 
                 # Store in output array
-                output[i, j, :] = pixel_value
+                y_end = y_start + patch_size
+                x_end = x_start + patch_size
+                output[y_start:y_end, x_start:x_end, :] = patch_output
                 
                 # Progress indicator
-                if (i * orig_width + j + 1) % 1000 == 0:
-                    progress = (i * orig_width + j + 1) / (orig_height * orig_width) * 100
-                    print(f"Progress: {progress:.1f}%")
+                tiles_done = tile_y * num_tiles_x + tile_x + 1
+                total_tiles = num_tiles_y * num_tiles_x
+                if tiles_done % 10 == 0 or tiles_done == total_tiles:
+                    progress = tiles_done / total_tiles * 100
+                    print(f"Progress: {progress:.1f}% ({tiles_done}/{total_tiles} tiles)")
+    
+    # Remove padding to get back to original dimensions
+    orig_height, orig_width, _ = padding_info['original_shape']
+    output = output[:orig_height, :orig_width, :]
     
     return output
 
 
-def batch_sliding_window_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                                  window_size: int = 129, batch_size: int = 16) -> np.ndarray:
+def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
+                        patch_size: int = 32, window_size: int = 132, batch_size: int = 16) -> np.ndarray:
     """
-    Perform batched sliding window inference for better GPU utilization.
+    Perform batched tile-based inference for better GPU utilization.
     
     Args:
         image: Input image as numpy array (H, W, C)
         model: Trained CompactUNet model
         device: PyTorch device
-        window_size: Size of input window (129x129)
-        batch_size: Number of patches to process in parallel
+        patch_size: Size of output patches (32x32)
+        window_size: Size of input window (132x132)
+        batch_size: Number of tiles to process in parallel
     
     Returns:
         Reconstructed image as numpy array
     """
-    # Pad image to handle edges
-    padded_image, padding_info = pad_image_for_inference(image, window_size)
-    height, width, channels = padded_image.shape
+    # Pad image to handle edge cases and make dimensions divisible
+    padded_image, padding_info = pad_image_for_reconstruction(image, patch_size)
+    padded_height, padded_width, channels = padded_image.shape
     
-    # Calculate output dimensions (same as original image)
-    orig_height, orig_width, _ = padding_info['original_shape']
+    # Calculate number of tiles
+    num_tiles_y = padded_height // patch_size
+    num_tiles_x = padded_width // patch_size
+    total_tiles = num_tiles_y * num_tiles_x
     
     # Initialize output array
-    output = np.zeros((orig_height, orig_width, channels), dtype=np.float32)
+    output = np.zeros((padded_height, padded_width, channels), dtype=np.float32)
     
     print(f"Input image shape: {image.shape}")
     print(f"Padded image shape: {padded_image.shape}")
-    print(f"Output image shape: {output.shape}")
-    print(f"Processing {orig_height * orig_width} patches in batches of {batch_size}...")
+    print(f"Number of tiles: {num_tiles_y} x {num_tiles_x} = {total_tiles}")
+    print(f"Patch size: {patch_size}x{patch_size}, Window size: {window_size}x{window_size}")
+    print(f"Batch size: {batch_size}")
     
-    # Collect all patches first
-    patches = []
+    # Collect all tiles and coordinates
+    tiles = []
     coordinates = []
     
-    for i in range(orig_height):
-        for j in range(orig_width):
-            # Calculate patch coordinates in padded image
-            y_start = i
-            x_start = j
-            y_end = y_start + window_size
-            x_end = x_start + window_size
+    for tile_y in range(num_tiles_y):
+        for tile_x in range(num_tiles_x):
+            y_start = tile_y * patch_size
+            x_start = tile_x * patch_size
             
-            # Extract patch
-            patch = padded_image[y_start:y_end, x_start:x_end, :]
+            # Extract 132x132 input patch
+            input_patch = extract_input_patch(padded_image, y_start, x_start, 
+                                            patch_size, window_size)
             
-            if patch.shape[:2] == (window_size, window_size):
-                patches.append(patch)
-                coordinates.append((i, j))
+            if input_patch.shape[:2] == (window_size, window_size):
+                tiles.append(input_patch)
+                coordinates.append((y_start, x_start))
     
-    # Process patches in batches
-    total_patches = len(patches)
-    
+    # Process tiles in batches
     with torch.no_grad():
-        for batch_start in range(0, total_patches, batch_size):
-            batch_end = min(batch_start + batch_size, total_patches)
-            batch_patches = patches[batch_start:batch_end]
+        for batch_start in range(0, len(tiles), batch_size):
+            batch_end = min(batch_start + batch_size, len(tiles))
+            batch_tiles = tiles[batch_start:batch_end]
             batch_coords = coordinates[batch_start:batch_end]
             
             # Preprocess batch
             batch_tensor = torch.stack([
-                preprocess_patch(patch).squeeze(0) for patch in batch_patches
+                preprocess_patch(tile).squeeze(0) for tile in batch_tiles
             ]).to(device)
             
             # Get model predictions
-            predictions = model(batch_tensor)
+            predictions = model(batch_tensor)  # (batch_size, 3, 32, 32)
             
             # Store results
-            for idx, (i, j) in enumerate(batch_coords):
-                pixel_value = predictions[idx].squeeze().cpu().numpy()
-                output[i, j, :] = pixel_value
+            for idx, (y_start, x_start) in enumerate(batch_coords):
+                patch_output = predictions[idx].cpu().numpy()    # (3, 32, 32)
+                patch_output = patch_output.transpose(1, 2, 0)   # (32, 32, 3)
+                
+                y_end = y_start + patch_size
+                x_end = x_start + patch_size
+                output[y_start:y_end, x_start:x_end, :] = patch_output
             
             # Progress indicator
-            progress = batch_end / total_patches * 100
-            print(f"Progress: {progress:.1f}%")
+            progress = batch_end / len(tiles) * 100
+            print(f"Progress: {progress:.1f}% ({batch_end}/{len(tiles)} tiles)")
+    
+    # Remove padding to get back to original dimensions
+    orig_height, orig_width, _ = padding_info['original_shape']
+    output = output[:orig_height, :orig_width, :]
     
     return output
 
@@ -235,13 +306,14 @@ def postprocess_output(output: np.ndarray) -> np.ndarray:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Sliding window inference for pixel reconstruction using CompactUNet')
+    parser = argparse.ArgumentParser(description='Patch-based inference for image reconstruction using CompactUNet')
     parser.add_argument('input_image', type=str, help='Path to input image')
     parser.add_argument('--model', type=str, default='checkpoints-compact-unet/best_model.pth',
                        help='Path to model checkpoint')
     parser.add_argument('--output', type=str, help='Output image path (default: input_reconstructed.png)')
     parser.add_argument('--use-gap', action='store_true', help='Use GAP variant of the model')
-    parser.add_argument('--window-size', type=int, default=129, help='Input window size')
+    parser.add_argument('--patch-size', type=int, default=32, help='Output patch size')
+    parser.add_argument('--window-size', type=int, default=132, help='Input window size')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for inference')
     parser.add_argument('--device', type=str, default='auto', help='Device to use (cpu, cuda, auto)')
     parser.add_argument('--use-batched', action='store_true', help='Use batched inference (faster)')
@@ -273,14 +345,16 @@ def main():
     model = load_model(args.model, device, use_gap=args.use_gap)
     
     # Perform inference
-    print("Starting sliding window inference...")
+    print("Starting patch-based inference...")
     if args.use_batched:
-        output = batch_sliding_window_inference(image_array, model, device, 
-                                              window_size=args.window_size, 
-                                              batch_size=args.batch_size)
+        output = batch_tile_inference(image_array, model, device, 
+                                    patch_size=args.patch_size, 
+                                    window_size=args.window_size,
+                                    batch_size=args.batch_size)
     else:
-        output = sliding_window_inference(image_array, model, device, 
-                                        window_size=args.window_size, stride=1)
+        output = tile_based_inference(image_array, model, device, 
+                                    patch_size=args.patch_size, 
+                                    window_size=args.window_size)
     
     # Postprocess output
     output_image = postprocess_output(output)
@@ -300,6 +374,7 @@ def main():
     print(f"Input resolution: {image_array.shape[1]}x{image_array.shape[0]}")
     print(f"Output resolution: {output_image.shape[1]}x{output_image.shape[0]}")
     print(f"Model: {'CompactUNetGAP' if args.use_gap else 'CompactUNet'}")
+    print(f"Patch size: {args.patch_size}x{args.patch_size}")
     print(f"Window size: {args.window_size}x{args.window_size}")
 
 

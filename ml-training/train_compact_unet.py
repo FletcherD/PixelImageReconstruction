@@ -83,7 +83,12 @@ class PixelLoss(nn.Module):
 
 def create_datasets(args) -> tuple:
     """Create training and validation datasets."""
-    synthesizer = PixelArtDataSynthesizer(seed=args.seed)
+    synthesizer = PixelArtDataSynthesizer(
+        crop_size=32, 
+        input_size=132, 
+        target_size=32, 
+        seed=args.seed
+    )
     
     datasets = []
     
@@ -97,7 +102,8 @@ def create_datasets(args) -> tuple:
             split='train',
             streaming=args.hf_streaming,
             crop_size=32,
-            input_size=129
+            input_size=132,
+            target_size=32
         )
         datasets.append(hf_dataset)
     
@@ -109,7 +115,8 @@ def create_datasets(args) -> tuple:
             num_samples=args.local_samples,
             synthesizer=synthesizer,
             crop_size=32,
-            input_size=129
+            input_size=132,
+            target_size=32
         )
         datasets.append(local_dataset)
     

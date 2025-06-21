@@ -29,15 +29,18 @@ class PixelArtDataSynthesizer:
     def __init__(self, 
                  crop_size: int = 33,
                  input_size: int = 128,
+                 target_size: int = 1,
                  seed: Optional[int] = None):
         """
         Args:
             crop_size: Size of the square crop from source images
             input_size: Size of the final input image
+            target_size: Size of the target patch (1 for center pixel, 32 for center patch)
             seed: Random seed for reproducibility
         """
         self.crop_size = crop_size
         self.input_size = input_size
+        self.target_size = target_size
         
         if seed is not None:
             random.seed(seed)
@@ -99,11 +102,21 @@ class PixelArtDataSynthesizer:
         # Load back from buffer
         return Image.open(buffer).convert('RGB')
     
-    def extract_center_pixel(self, image: Image.Image) -> Image.Image:
-        """Extract the center 1x1 pixel from the cropped image."""
-        # Center pixel coordinates
-        center_x = center_y = self.crop_size // 2
-        return image.crop((center_x, center_y, center_x + 1, center_y + 1))
+    def extract_center_region(self, image: Image.Image) -> Image.Image:
+        """Extract the center region from the cropped image."""
+        if self.target_size == 1:
+            # Extract center 1x1 pixel
+            center_x = center_y = self.crop_size // 2
+            return image.crop((center_x, center_y, center_x + 1, center_y + 1))
+        else:
+            # Extract center patch of specified size
+            center_x = center_y = self.crop_size // 2
+            half_target = self.target_size // 2
+            left = center_x - half_target
+            top = center_y - half_target
+            right = left + self.target_size
+            bottom = top + self.target_size
+            return image.crop((left, top, right, bottom))
     
     def scale_to_final(self, image: Image.Image) -> Image.Image:
         """Scale image to final size."""
@@ -114,13 +127,13 @@ class PixelArtDataSynthesizer:
         Create a (input, ground_truth) pair from source image.
         
         Returns:
-            Tuple of (degraded_input_132x132, ground_truth_1x1)
+            Tuple of (degraded_input, ground_truth_patch)
         """
         # Step 1: Random crop
         cropped = self.random_crop(source_image)
         
-        # Step 2: Extract center 1x1 pixel (this becomes our ground truth)
-        ground_truth = self.extract_center_pixel(cropped)
+        # Step 2: Extract center region (this becomes our ground truth)
+        ground_truth = self.extract_center_region(cropped)
         
         # Step 3: Scale up with random interpolation
         scaled = self.random_scale(cropped)
@@ -144,7 +157,8 @@ class PixelArtDataset(Dataset):
                  transform_input: Optional[transforms.Compose] = None,
                  transform_target: Optional[transforms.Compose] = None,
                  crop_size: int = 33,
-                 input_size: int = 128):
+                 input_size: int = 128,
+                 target_size: int = 1):
         """
         Args:
             source_images_dir: Directory containing source images
@@ -152,10 +166,13 @@ class PixelArtDataset(Dataset):
             synthesizer: Data synthesizer (creates one if None)
             transform_input: Transforms for input images
             transform_target: Transforms for target images
+            crop_size: Size of the square crop from source images
+            input_size: Size of the final input image
+            target_size: Size of the target patch (1 for center pixel, 32 for center patch)
         """
         self.source_images_dir = Path(source_images_dir)
         self.num_samples = num_samples
-        self.synthesizer = synthesizer or PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size)
+        self.synthesizer = synthesizer or PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size)
         self.transform_input = transform_input
         self.transform_target = transform_target
         
@@ -216,6 +233,7 @@ class HuggingFacePixelArtDataset(Dataset):
                  streaming: bool = False,
                  crop_size: int = 33,
                  input_size: int = 128,
+                 target_size: int = 1,
                  **load_dataset_kwargs):
         """
         Args:
@@ -227,11 +245,14 @@ class HuggingFacePixelArtDataset(Dataset):
             split: Dataset split to use (train, validation, test)
             image_column: Name of the column containing images
             streaming: Whether to use streaming mode for large datasets
+            crop_size: Size of the square crop from source images
+            input_size: Size of the final input image
+            target_size: Size of the target patch (1 for center pixel, 32 for center patch)
             **load_dataset_kwargs: Additional arguments to pass to load_dataset
         """
         self.dataset_name = dataset_name
         self.num_samples = num_samples
-        self.synthesizer = synthesizer or PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size)
+        self.synthesizer = synthesizer or PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size)
         self.transform_input = transform_input
         self.transform_target = transform_target
         self.image_column = image_column
@@ -312,6 +333,7 @@ def create_hf_dataset(dataset_name: str,
                      streaming: bool = False,
                      crop_size: int = 33,
                      input_size: int = 128,
+                     target_size: int = 1,
                      **load_dataset_kwargs) -> HuggingFacePixelArtDataset:
     """
     Create a HuggingFacePixelArtDataset and optionally save some examples.
@@ -348,12 +370,13 @@ def create_hf_dataset(dataset_name: str,
         streaming=streaming,
         crop_size=crop_size,
         input_size=input_size,
+        target_size=target_size,
         **load_dataset_kwargs
     )
     
     if save_examples:
         os.makedirs(examples_dir, exist_ok=True)
-        synthesizer = PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, seed=69)  # Fixed seed for reproducible examples
+        synthesizer = PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size, seed=69)  # Fixed seed for reproducible examples
         
         print(f"Saving example pairs to {examples_dir}/")
         for i in range(num_samples):
@@ -389,7 +412,8 @@ def create_dataset(source_images_dir: str,
                   save_examples: bool = True,
                   examples_dir: str = "dataset_examples",
                   crop_size: int = 33,
-                  input_size: int = 128) -> PixelArtDataset:
+                  input_size: int = 128,
+                  target_size: int = 1) -> PixelArtDataset:
     """
     Create a PixelArtDataset and optionally save some examples.
     
@@ -417,12 +441,13 @@ def create_dataset(source_images_dir: str,
         transform_input=input_transform,
         transform_target=target_transform,
         crop_size=crop_size,
-        input_size=input_size
+        input_size=input_size,
+        target_size=target_size
     )
     
     if save_examples:
         os.makedirs(examples_dir, exist_ok=True)
-        synthesizer = PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, seed=42)  # Fixed seed for reproducible examples
+        synthesizer = PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size, seed=42)  # Fixed seed for reproducible examples
         
         print(f"Saving example pairs to {examples_dir}/")
         for i in range(num_samples):  # Save examples
@@ -461,6 +486,8 @@ if __name__ == "__main__":
                        help="Size of the square crop from source images")
     parser.add_argument("--input_size", type=int, default=128,
                        help="Size of the final input image")
+    parser.add_argument("--target_size", type=int, default=1,
+                       help="Size of the target patch (1 for center pixel, 32 for center patch)")
     
     args = parser.parse_args()
     
@@ -479,7 +506,8 @@ if __name__ == "__main__":
             image_column=args.image_column,
             streaming=args.streaming,
             crop_size=args.crop_size,
-            input_size=args.input_size
+            input_size=args.input_size,
+            target_size=args.target_size
         )
     else:
         print(f"Creating dataset with {args.num_samples} samples from {args.source_dir}")
@@ -489,12 +517,13 @@ if __name__ == "__main__":
             save_examples=True,
             examples_dir=args.examples_dir,
             crop_size=args.crop_size,
-            input_size=args.input_size
+            input_size=args.input_size,
+            target_size=args.target_size
         )
     
     print(f"Dataset created successfully with {len(dataset)} samples")
     
     # Test loading a sample
     input_tensor, target_tensor = dataset[0]
-    print(f"Input shape: {input_tensor.shape}")   # Should be [3, 132, 132]
-    print(f"Target shape: {target_tensor.shape}") # Should be [3, 1, 1]
+    print(f"Input shape: {input_tensor.shape}")   # Should be [3, input_size, input_size]
+    print(f"Target shape: {target_tensor.shape}") # Should be [3, target_size, target_size]

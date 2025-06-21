@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Compact U-Net architecture for patch-based denoising from 129x129 inputs.
+Compact U-Net architecture for patch-based denoising from 132x132 inputs.
 
-Input: 129x129x3 RGB patches (noisy images)
-Output: 1x1x3 RGB values (center pixel prediction)
+Input: 132x132x3 RGB patches (noisy images)
+Output: 32x32x3 RGB patches (center region prediction)
 """
 
 import torch
@@ -86,13 +86,13 @@ class DecoderBlock(nn.Module):
 
 class CompactUNet(nn.Module):
     """
-    Compact U-Net for center pixel prediction from 129x129 patches.
+    Compact U-Net for center patch prediction from 132x132 patches.
     
     Architecture:
-    - Encoder: 129x129 → 65x65 → 33x33 → 17x17 → 9x9
+    - Encoder: 132x132 → 66x66 → 33x33 → 17x17 → 9x9
     - Bottleneck: 9x9 → 9x9 (256 channels)
-    - Decoder: 9x9 → 17x17 → 33x33 → 65x65 → 129x129
-    - Center pixel extraction
+    - Decoder: 9x9 → 17x17 → 33x33 (stop here for 32x32 output)
+    - Center patch extraction: 32x32 from 33x33
     """
     
     def __init__(self, in_channels: int = 3, out_channels: int = 3, 
@@ -103,9 +103,9 @@ class CompactUNet(nn.Module):
         self.final_activation = final_activation
         
         # Encoder (downsampling path) - compact channel progression
-        # 129x129 → 65x65
+        # 132x132 → 66x66
         self.enc1 = EncoderBlock(in_channels, 16)
-        # 65x65 → 33x33  
+        # 66x66 → 33x33  
         self.enc2 = EncoderBlock(16, 32)
         # 33x33 → 17x17
         self.enc3 = EncoderBlock(32, 64)
@@ -118,60 +118,50 @@ class CompactUNet(nn.Module):
             ConvBlock(256, 256, dropout=dropout)
         )
         
-        # Decoder (upsampling path)
+        # Decoder (upsampling path) - only to 33x33 for 32x32 output
         # 9x9 → 17x17 (with skip from enc4: 128 channels)
         self.dec4 = DecoderBlock(256, 128, 128, dropout=dropout, use_transpose=use_transpose)
         # 17x17 → 33x33 (with skip from enc3: 64 channels)
         self.dec3 = DecoderBlock(128, 64, 64, dropout=dropout, use_transpose=use_transpose)
-        # 33x33 → 65x65 (with skip from enc2: 32 channels)
-        self.dec2 = DecoderBlock(64, 32, 32, use_transpose=use_transpose)
-        # 65x65 → 129x129 (with skip from enc1: 16 channels)
-        self.dec1 = DecoderBlock(32, 16, 16, use_transpose=use_transpose)
         
         # Final output layer
-        self.final_conv = nn.Conv2d(16, out_channels, 1)
+        self.final_conv = nn.Conv2d(64, out_channels, 1)
     
     def forward(self, x):
-        # Store input size for center pixel extraction
-        batch_size = x.size(0)
-        center_idx = x.size(2) // 2  # Should be 64 for 129x129 input
-        
         # Encoder path
-        x1, skip1 = self.enc1(x)    # skip1: 129x129x16, x1: 65x65x16
-        x2, skip2 = self.enc2(x1)   # skip2: 65x65x32, x2: 33x33x32
+        x1, skip1 = self.enc1(x)    # skip1: 132x132x16, x1: 66x66x16
+        x2, skip2 = self.enc2(x1)   # skip2: 66x66x32, x2: 33x33x32
         x3, skip3 = self.enc3(x2)   # skip3: 33x33x64, x3: 17x17x64
         x4, skip4 = self.enc4(x3)   # skip4: 17x17x128, x4: 9x9x128
         
         # Bottleneck
         x = self.bottleneck(x4)     # 9x9x256
         
-        # Decoder path with skip connections
+        # Decoder path with skip connections (only to 33x33)
         x = self.dec4(x, skip4)     # 9x9 → 17x17, concat with skip4
         x = self.dec3(x, skip3)     # 17x17 → 33x33, concat with skip3
-        x = self.dec2(x, skip2)     # 33x33 → 65x65, concat with skip2
-        x = self.dec1(x, skip1)     # 65x65 → 129x129, concat with skip1
         
         # Final convolution
-        x = self.final_conv(x)      # 129x129x3
+        x = self.final_conv(x)      # 33x33x3
         
-        # Extract center pixel
-        center_pixel = x[:, :, center_idx, center_idx]  # Shape: (batch_size, channels)
-        center_pixel = center_pixel.unsqueeze(-1).unsqueeze(-1)  # Shape: (batch_size, channels, 1, 1)
+        # Extract center 32x32 patch from 33x33 output
+        # Center crop: remove 1 pixel from each side
+        center_patch = x[:, :, 0:32, 0:32]  # Shape: (batch_size, channels, 32, 32)
         
         # Final activation
         if self.final_activation == 'sigmoid':
-            center_pixel = torch.sigmoid(center_pixel)
+            center_patch = torch.sigmoid(center_patch)
         elif self.final_activation == 'tanh':
-            center_pixel = torch.tanh(center_pixel)
+            center_patch = torch.tanh(center_patch)
         # If 'none', return raw logits
         
-        return center_pixel
+        return center_patch
 
 
 class CompactUNetGAP(nn.Module):
     """
-    Compact U-Net variant using Global Average Pooling for center pixel prediction.
-    More parameter-efficient alternative that uses encoder + GAP instead of full U-Net.
+    Compact U-Net variant using Global Average Pooling for center patch prediction.
+    More parameter-efficient alternative that uses encoder + GAP + upsampling instead of full U-Net.
     """
     
     def __init__(self, in_channels: int = 3, out_channels: int = 3, 
@@ -192,7 +182,7 @@ class CompactUNetGAP(nn.Module):
             ConvBlock(256, 256, dropout=dropout)
         )
         
-        # Global Average Pooling + MLP for center pixel prediction
+        # Global Average Pooling + MLP for feature extraction
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.mlp = nn.Sequential(
             nn.Conv2d(256, 128, 1),
@@ -200,12 +190,14 @@ class CompactUNetGAP(nn.Module):
             nn.Dropout2d(dropout),
             nn.Conv2d(128, 64, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, out_channels, 1)
+            nn.Conv2d(64, 32*32*out_channels, 1)  # Predict flattened 32x32 patch
         )
     
     def forward(self, x):
+        batch_size = x.size(0)
+        
         # Encoder path
-        x1, _ = self.enc1(x)    # 65x65x16
+        x1, _ = self.enc1(x)    # 66x66x16
         x2, _ = self.enc2(x1)   # 33x33x32
         x3, _ = self.enc3(x2)   # 17x17x64
         x4, _ = self.enc4(x3)   # 9x9x128
@@ -215,7 +207,10 @@ class CompactUNetGAP(nn.Module):
         
         # Global Average Pooling + MLP
         x = self.gap(x)         # 1x1x256
-        x = self.mlp(x)         # 1x1x3
+        x = self.mlp(x)         # 1x1x(32*32*3)
+        
+        # Reshape to 32x32 patch
+        x = x.view(batch_size, 3, 32, 32)  # Shape: (batch_size, 3, 32, 32)
         
         # Final activation
         if self.final_activation == 'sigmoid':
@@ -235,7 +230,7 @@ def test_model():
     """Test the model architecture with random input."""
     # Test CompactUNet
     model = CompactUNet()
-    x = torch.randn(2, 3, 129, 129)  # Batch of 2, 3 channels, 129x129
+    x = torch.randn(2, 3, 132, 132)  # Batch of 2, 3 channels, 132x132
     
     print(f"Input shape: {x.shape}")
     print(f"CompactUNet parameters: {count_parameters(model):,}")
