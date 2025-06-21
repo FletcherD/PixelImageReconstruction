@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Compact U-Net architecture for patch-based denoising from 132x132 inputs.
+Compact U-Net architecture for patch-based denoising from 128x128 inputs.
 
-Input: 132x132x3 RGB patches (noisy images)
+Input: 128x128x3 RGB patches (noisy images)
 Output: 32x32x3 RGB patches (center region prediction)
 """
 
@@ -86,13 +86,12 @@ class DecoderBlock(nn.Module):
 
 class CompactUNet(nn.Module):
     """
-    Compact U-Net for center patch prediction from 132x132 patches.
+    Compact U-Net for center patch prediction from 128x128 patches.
     
     Architecture:
-    - Encoder: 132x132 → 66x66 → 33x33 → 17x17 → 9x9
-    - Bottleneck: 9x9 → 9x9 (256 channels)
-    - Decoder: 9x9 → 17x17 → 33x33 (stop here for 32x32 output)
-    - Center patch extraction: 32x32 from 33x33
+    - Encoder: 128x128 → 64x64 → 32x32 → 16x16 → 8x8
+    - Bottleneck: 8x8 → 8x8 (256 channels)
+    - Decoder: 8x8 → 16x16 → 32x32 (exact 32x32 output)
     """
     
     def __init__(self, in_channels: int = 3, out_channels: int = 3, 
@@ -103,25 +102,25 @@ class CompactUNet(nn.Module):
         self.final_activation = final_activation
         
         # Encoder (downsampling path) - compact channel progression
-        # 132x132 → 66x66
+        # 128x128 → 64x64
         self.enc1 = EncoderBlock(in_channels, 16)
-        # 66x66 → 33x33  
+        # 64x64 → 32x32  
         self.enc2 = EncoderBlock(16, 32)
-        # 33x33 → 17x17
+        # 32x32 → 16x16
         self.enc3 = EncoderBlock(32, 64)
-        # 17x17 → 9x9
+        # 16x16 → 8x8
         self.enc4 = EncoderBlock(64, 128, dropout=dropout)
         
-        # Bottleneck at 9x9
+        # Bottleneck at 8x8
         self.bottleneck = nn.Sequential(
             ConvBlock(128, 256, dropout=dropout),
             ConvBlock(256, 256, dropout=dropout)
         )
         
-        # Decoder (upsampling path) - only to 33x33 for 32x32 output
-        # 9x9 → 17x17 (with skip from enc4: 128 channels)
+        # Decoder (upsampling path) - to exact 32x32 output
+        # 8x8 → 16x16 (with skip from enc4: 128 channels)
         self.dec4 = DecoderBlock(256, 128, 128, dropout=dropout, use_transpose=use_transpose)
-        # 17x17 → 33x33 (with skip from enc3: 64 channels)
+        # 16x16 → 32x32 (with skip from enc3: 64 channels)
         self.dec3 = DecoderBlock(128, 64, 64, dropout=dropout, use_transpose=use_transpose)
         
         # Final output layer
@@ -129,33 +128,29 @@ class CompactUNet(nn.Module):
     
     def forward(self, x):
         # Encoder path
-        x1, skip1 = self.enc1(x)    # skip1: 132x132x16, x1: 66x66x16
-        x2, skip2 = self.enc2(x1)   # skip2: 66x66x32, x2: 33x33x32
-        x3, skip3 = self.enc3(x2)   # skip3: 33x33x64, x3: 17x17x64
-        x4, skip4 = self.enc4(x3)   # skip4: 17x17x128, x4: 9x9x128
+        x1, skip1 = self.enc1(x)    # skip1: 128x128x16, x1: 64x64x16
+        x2, skip2 = self.enc2(x1)   # skip2: 64x64x32, x2: 32x32x32
+        x3, skip3 = self.enc3(x2)   # skip3: 32x32x64, x3: 16x16x64
+        x4, skip4 = self.enc4(x3)   # skip4: 16x16x128, x4: 8x8x128
         
         # Bottleneck
-        x = self.bottleneck(x4)     # 9x9x256
+        x = self.bottleneck(x4)     # 8x8x256
         
-        # Decoder path with skip connections (only to 33x33)
-        x = self.dec4(x, skip4)     # 9x9 → 17x17, concat with skip4
-        x = self.dec3(x, skip3)     # 17x17 → 33x33, concat with skip3
+        # Decoder path with skip connections to exact 32x32
+        x = self.dec4(x, skip4)     # 8x8 → 16x16, concat with skip4
+        x = self.dec3(x, skip3)     # 16x16 → 32x32, concat with skip3
         
         # Final convolution
-        x = self.final_conv(x)      # 33x33x3
-        
-        # Extract center 32x32 patch from 33x33 output
-        # Center crop: remove 1 pixel from each side
-        center_patch = x[:, :, 0:32, 0:32]  # Shape: (batch_size, channels, 32, 32)
+        x = self.final_conv(x)      # 32x32x3
         
         # Final activation
         if self.final_activation == 'sigmoid':
-            center_patch = torch.sigmoid(center_patch)
+            x = torch.sigmoid(x)
         elif self.final_activation == 'tanh':
-            center_patch = torch.tanh(center_patch)
+            x = torch.tanh(x)
         # If 'none', return raw logits
         
-        return center_patch
+        return x
 
 
 class CompactUNetGAP(nn.Module):
@@ -230,7 +225,7 @@ def test_model():
     """Test the model architecture with random input."""
     # Test CompactUNet
     model = CompactUNet()
-    x = torch.randn(2, 3, 132, 132)  # Batch of 2, 3 channels, 132x132
+    x = torch.randn(2, 3, 128, 128)  # Batch of 2, 3 channels, 128x128
     
     print(f"Input shape: {x.shape}")
     print(f"CompactUNet parameters: {count_parameters(model):,}")

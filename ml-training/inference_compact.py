@@ -3,7 +3,7 @@
 Patch-based inference script for image reconstruction using CompactUNet.
 
 Takes a large image and reconstructs it using the trained CompactUNet model.
-The model takes 132x132 patches and outputs 32x32 patches.
+The model takes 128x128 patches and outputs 32x32 patches.
 Uses non-overlapping 32x32 windows for efficient reconstruction.
 """
 
@@ -82,24 +82,24 @@ def pad_image_for_reconstruction(image: np.ndarray, patch_size: int = 32) -> tup
 
 
 def extract_input_patch(image: np.ndarray, i: int, j: int, 
-                       patch_size: int = 32, window_size: int = 132) -> np.ndarray:
+                       patch_size: int = 32, window_size: int = 128) -> np.ndarray:
     """
-    Extract 132x132 input patch centered on 32x32 output region.
+    Extract 128x128 input patch centered on 32x32 output region.
     
     Args:
         image: Input image
         i, j: Top-left coordinates of 32x32 output region
         patch_size: Size of output patch (32)
-        window_size: Size of input window (132)
+        window_size: Size of input window (128)
     
     Returns:
-        132x132 input patch
+        128x128 input patch
     """
     # Calculate center of 32x32 region
     center_y = i + patch_size // 2
     center_x = j + patch_size // 2
     
-    # Calculate 132x132 window coordinates
+    # Calculate 128x128 window coordinates
     half_window = window_size // 2
     y_start = center_y - half_window
     y_end = center_y + half_window
@@ -134,7 +134,7 @@ def extract_input_patch(image: np.ndarray, i: int, j: int,
 
 
 def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                        patch_size: int = 32, window_size: int = 132) -> np.ndarray:
+                        patch_size: int = 32, window_size: int = 128) -> np.ndarray:
     """
     Perform tile-based inference on the input image.
     
@@ -143,7 +143,7 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
         model: Trained CompactUNet model
         device: PyTorch device
         patch_size: Size of output patches (32x32)
-        window_size: Size of input window (132x132)
+        window_size: Size of input window (128x128)
     
     Returns:
         Reconstructed image as numpy array
@@ -171,7 +171,7 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
                 y_start = tile_y * patch_size
                 x_start = tile_x * patch_size
                 
-                # Extract 132x132 input patch centered on this 32x32 tile
+                # Extract 128x128 input patch centered on this 32x32 tile
                 input_patch = extract_input_patch(padded_image, y_start, x_start, 
                                                 patch_size, window_size)
                 
@@ -211,7 +211,7 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
 
 
 def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                        patch_size: int = 32, window_size: int = 132, batch_size: int = 16) -> np.ndarray:
+                        patch_size: int = 32, window_size: int = 128, batch_size: int = 16) -> np.ndarray:
     """
     Perform batched tile-based inference for better GPU utilization.
     
@@ -220,7 +220,7 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
         model: Trained CompactUNet model
         device: PyTorch device
         patch_size: Size of output patches (32x32)
-        window_size: Size of input window (132x132)
+        window_size: Size of input window (128x128)
         batch_size: Number of tiles to process in parallel
     
     Returns:
@@ -253,7 +253,7 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
             y_start = tile_y * patch_size
             x_start = tile_x * patch_size
             
-            # Extract 132x132 input patch
+            # Extract 128x128 input patch
             input_patch = extract_input_patch(padded_image, y_start, x_start, 
                                             patch_size, window_size)
             
@@ -313,7 +313,7 @@ def main():
     parser.add_argument('--output', type=str, help='Output image path (default: input_reconstructed.png)')
     parser.add_argument('--use-gap', action='store_true', help='Use GAP variant of the model')
     parser.add_argument('--patch-size', type=int, default=32, help='Output patch size')
-    parser.add_argument('--window-size', type=int, default=132, help='Input window size')
+    parser.add_argument('--window-size', type=int, default=128, help='Input window size')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for inference')
     parser.add_argument('--device', type=str, default='auto', help='Device to use (cpu, cuda, auto)')
     parser.add_argument('--use-batched', action='store_true', help='Use batched inference (faster)')
