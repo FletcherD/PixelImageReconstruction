@@ -107,7 +107,7 @@ def find_candidate_spacings(peaks):
     Returns:
         np.ndarray: Array of candidate spacing values that show good peak alignment
     """
-    spacings = np.arange(2.0, 10.0, 0.01)
+    spacings = np.arange(2.2, 10.0, 0.01)
     spacing_errors = [calculate_spacing_error(peaks, s) for s in spacings]
     spacing_errors = np.array(spacing_errors) * -1.0
     

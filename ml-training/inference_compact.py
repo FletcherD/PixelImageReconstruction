@@ -15,6 +15,7 @@ import argparse
 from pathlib import Path
 import sys
 import os
+import pandas as pd
 
 from compact_unet import CompactUNet, CompactUNetGAP
 
@@ -170,7 +171,7 @@ def mc_dropout_inference_single_patch(model: torch.nn.Module, patch_tensor: torc
     
     with torch.no_grad():
         for _ in range(n_samples):
-            mu, sigma_sq = model(patch_tensor)
+            mu, sigma_sq, transform_params = model(patch_tensor)
             mu_predictions.append(mu.cpu().numpy())
             sigma_sq_predictions.append(sigma_sq.cpu().numpy())
     
@@ -195,7 +196,8 @@ def mc_dropout_inference_single_patch(model: torch.nn.Module, patch_tensor: torc
 
 
 def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                        patch_size: int = 32, window_size: int = 128) -> tuple:
+                        patch_size: int = 32, window_size: int = 128, 
+                        collect_transforms: bool = False) -> tuple:
     """
     Perform tile-based inference on the input image.
     
@@ -226,6 +228,9 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
     mean_output = np.zeros((output_height, output_width, channels), dtype=np.float32)
     variance_output = np.zeros((output_height, output_width, channels), dtype=np.float32)
     
+    # Collect transform parameters if requested
+    transform_data = [] if collect_transforms else None
+    
     print(f"Input image shape: {image.shape}")
     print(f"Padded image shape: {padded_image.shape}")
     print(f"Output image shape: {mean_output.shape}")
@@ -252,13 +257,27 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
                 # Preprocess patch
                 patch_tensor = preprocess_patch(input_patch).to(device)
                 
-                # Get model prediction (32x32 patch)
-                mu, sigma_sq = model(patch_tensor)
+                # Get model prediction (32x32 patch + transform params)
+                mu, sigma_sq, transform_params = model(patch_tensor)
                 
                 # Convert predictions back to numpy
                 # mu and sigma_sq shapes: (1, 3, 32, 32)
                 patch_mean = mu.squeeze(0).cpu().numpy().transpose(1, 2, 0)      # (32, 32, 3)
                 patch_variance = sigma_sq.squeeze(0).cpu().numpy().transpose(1, 2, 0)  # (32, 32, 3)
+                
+                # Collect transform parameters if requested
+                if collect_transforms:
+                    transform_vals = transform_params.squeeze(0).cpu().numpy()  # (4,)
+                    transform_data.append({
+                        'tile_y': tile_y,
+                        'tile_x': tile_x,
+                        'x_scale': transform_vals[0],
+                        'y_scale': transform_vals[1],
+                        'x_offset': transform_vals[2],
+                        'y_offset': transform_vals[3],
+                        'output_y_start': tile_y * patch_size,
+                        'output_x_start': tile_x * patch_size
+                    })
                 
                 # Store in output arrays (coordinates in output space)
                 output_y_start = tile_y * patch_size
@@ -282,7 +301,10 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
     mean_output = mean_output[:orig_output_height, :orig_output_width, :]
     variance_output = variance_output[:orig_output_height, :orig_output_width, :]
     
-    return mean_output, variance_output
+    if collect_transforms:
+        return mean_output, variance_output, transform_data
+    else:
+        return mean_output, variance_output
 
 
 def tile_based_inference_mc_dropout(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
@@ -380,7 +402,8 @@ def tile_based_inference_mc_dropout(image: np.ndarray, model: torch.nn.Module, d
 
 
 def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                        patch_size: int = 32, window_size: int = 128, batch_size: int = 16) -> tuple:
+                        patch_size: int = 32, window_size: int = 128, batch_size: int = 16,
+                        collect_transforms: bool = False) -> tuple:
     """
     Perform batched tile-based inference for better GPU utilization.
     
@@ -412,6 +435,9 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
     output_width = padded_width // 4
     mean_output = np.zeros((output_height, output_width, channels), dtype=np.float32)
     variance_output = np.zeros((output_height, output_width, channels), dtype=np.float32)
+    
+    # Collect transform parameters if requested
+    transform_data = [] if collect_transforms else None
     
     print(f"Input image shape: {image.shape}")
     print(f"Padded image shape: {padded_image.shape}")
@@ -452,12 +478,26 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
             ]).to(device)
             
             # Get model predictions
-            mu_batch, sigma_sq_batch = model(batch_tensor)  # Each: (batch_size, 3, 32, 32)
+            mu_batch, sigma_sq_batch, transform_batch = model(batch_tensor)  # Each: (batch_size, 3, 32, 32) and (batch_size, 4)
             
             # Store results
             for idx, (tile_y, tile_x) in enumerate(batch_coords):
                 patch_mean = mu_batch[idx].cpu().numpy().transpose(1, 2, 0)      # (32, 32, 3)
                 patch_variance = sigma_sq_batch[idx].cpu().numpy().transpose(1, 2, 0)  # (32, 32, 3)
+                
+                # Collect transform parameters if requested
+                if collect_transforms:
+                    transform_vals = transform_batch[idx].cpu().numpy()  # (4,)
+                    transform_data.append({
+                        'tile_y': tile_y,
+                        'tile_x': tile_x,
+                        'x_scale': transform_vals[0],
+                        'y_scale': transform_vals[1],
+                        'x_offset': transform_vals[2],
+                        'y_offset': transform_vals[3],
+                        'output_y_start': tile_y * patch_size,
+                        'output_x_start': tile_x * patch_size
+                    })
                 
                 # Store in output arrays (coordinates in output space)
                 output_y_start = tile_y * patch_size
@@ -478,7 +518,10 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
     mean_output = mean_output[:orig_output_height, :orig_output_width, :]
     variance_output = variance_output[:orig_output_height, :orig_output_width, :]
     
-    return mean_output, variance_output
+    if collect_transforms:
+        return mean_output, variance_output, transform_data
+    else:
+        return mean_output, variance_output
 
 
 def postprocess_output(output: np.ndarray) -> np.ndarray:
@@ -506,6 +549,8 @@ def main():
     parser.add_argument('--mc-samples', type=int, default=10, help='Number of Monte Carlo dropout samples (default: 10)')
     parser.add_argument('--uncertainty-output', type=str, help='Path to save uncertainty map (default: input_uncertainty.png)')
     parser.add_argument('--variance-output', type=str, help='Path to save variance map from heteroscedastic model (default: input_variance.png)')
+    parser.add_argument('--print-transforms', action='store_true', help='Print table of transform parameters for all patches')
+    parser.add_argument('--save-transforms', type=str, help='Save transform parameters table to CSV file')
     
     args = parser.parse_args()
     
@@ -533,6 +578,9 @@ def main():
     print(f"Loading model from: {args.model}")
     model = load_model(args.model, device, use_gap=args.use_gap)
     
+    # Determine if we need to collect transforms
+    collect_transforms = args.print_transforms or args.save_transforms
+    
     # Perform inference
     if args.mc_dropout:
         print("Starting Monte Carlo dropout inference...")
@@ -546,17 +594,37 @@ def main():
         # Postprocess outputs
         output_image = postprocess_output(mean_output)
         uncertainty_image = postprocess_output(np.sqrt(uncertainty_output))  # Standard deviation
+        transform_data = None  # MC dropout doesn't support transform collection yet
     else:
         print("Starting patch-based inference...")
         if args.use_batched:
-            mean_output, variance_output = batch_tile_inference(image_array, model, device, 
-                                        patch_size=args.patch_size, 
-                                        window_size=args.window_size,
-                                        batch_size=args.batch_size)
+            if collect_transforms:
+                mean_output, variance_output, transform_data = batch_tile_inference(
+                    image_array, model, device, 
+                    patch_size=args.patch_size, 
+                    window_size=args.window_size,
+                    batch_size=args.batch_size,
+                    collect_transforms=True)
+            else:
+                mean_output, variance_output = batch_tile_inference(
+                    image_array, model, device, 
+                    patch_size=args.patch_size, 
+                    window_size=args.window_size,
+                    batch_size=args.batch_size)
+                transform_data = None
         else:
-            mean_output, variance_output = tile_based_inference(image_array, model, device, 
-                                        patch_size=args.patch_size, 
-                                        window_size=args.window_size)
+            if collect_transforms:
+                mean_output, variance_output, transform_data = tile_based_inference(
+                    image_array, model, device, 
+                    patch_size=args.patch_size, 
+                    window_size=args.window_size,
+                    collect_transforms=True)
+            else:
+                mean_output, variance_output = tile_based_inference(
+                    image_array, model, device, 
+                    patch_size=args.patch_size, 
+                    window_size=args.window_size)
+                transform_data = None
         
         # Postprocess outputs
         output_image = postprocess_output(mean_output)
@@ -617,6 +685,28 @@ def main():
             print(f"  Mean: {np.mean(variance_stats):.4f}")
             print(f"  Min: {np.min(variance_stats):.4f}")
             print(f"  Max: {np.max(variance_stats):.4f}")
+    
+    # Handle transform parameters table
+    if transform_data is not None:
+        df = pd.DataFrame(transform_data)
+        
+        if args.print_transforms:
+            print(f"\nTransform Parameters Table:")
+            print("=" * 80)
+            print(df.to_string(index=False, float_format='%.4f'))
+            
+            # Summary statistics
+            print(f"\nTransform Parameter Statistics:")
+            print(f"X Scale - Mean: {df['x_scale'].mean():.4f}, Std: {df['x_scale'].std():.4f}, Range: [{df['x_scale'].min():.4f}, {df['x_scale'].max():.4f}]")
+            print(f"Y Scale - Mean: {df['y_scale'].mean():.4f}, Std: {df['y_scale'].std():.4f}, Range: [{df['y_scale'].min():.4f}, {df['y_scale'].max():.4f}]")
+            print(f"X Offset - Mean: {df['x_offset'].mean():.4f}, Std: {df['x_offset'].std():.4f}, Range: [{df['x_offset'].min():.4f}, {df['x_offset'].max():.4f}]")
+            print(f"Y Offset - Mean: {df['y_offset'].mean():.4f}, Std: {df['y_offset'].std():.4f}, Range: [{df['y_offset'].min():.4f}, {df['y_offset'].max():.4f}]")
+        
+        if args.save_transforms:
+            df.to_csv(args.save_transforms, index=False)
+            print(f"Transform parameters saved to: {args.save_transforms}")
+    elif collect_transforms:
+        print("Warning: Transform collection was requested but not supported for the current inference mode.")
 
 
 if __name__ == "__main__":

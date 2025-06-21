@@ -123,8 +123,17 @@ class CompactUNet(nn.Module):
         # 16x16 → 32x32 (with skip from enc3: 64 channels)
         self.dec3 = DecoderBlock(128, 64, 64, dropout=dropout, use_transpose=use_transpose)
         
-        # Final output layer - outputs 2x channels (mu + sigma^2)
+        # Final output layer - outputs 2x channels (mu + sigma^2) + 4 transform params
         self.final_conv = nn.Conv2d(64, out_channels * 2, 1)
+        
+        # Transform prediction head - outputs 4 scalars (x_scale, y_scale, x_offset, y_offset)
+        self.transform_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(64, 32, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 4, 1),
+            nn.Flatten()
+        )
     
     def forward(self, x):
         # Encoder path
@@ -137,14 +146,17 @@ class CompactUNet(nn.Module):
         x = self.bottleneck(x4)     # 8x8x256
         
         # Decoder path with skip connections to exact 32x32
-        x = self.dec4(x, skip4)     # 8x8 → 16x16, concat with skip4
-        x = self.dec3(x, skip3)     # 16x16 → 32x32, concat with skip3
+        dec_out = self.dec4(x, skip4)     # 8x8 → 16x16, concat with skip4
+        dec_out = self.dec3(dec_out, skip3)     # 16x16 → 32x32, concat with skip3
         
-        # Final convolution
-        x = self.final_conv(x)      # 32x32x6 (3 for mu, 3 for sigma^2)
+        # Final convolution for image prediction
+        img_out = self.final_conv(dec_out)      # 32x32x6 (3 for mu, 3 for sigma^2)
         
-        # Split into mu and sigma^2
-        mu, log_var = torch.chunk(x, 2, dim=1)  # Each: 32x32x3
+        # Transform prediction
+        transform_out = self.transform_head(dec_out)  # 4 scalars
+        
+        # Split image output into mu and sigma^2
+        mu, log_var = torch.chunk(img_out, 2, dim=1)  # Each: 32x32x3
         
         # Apply activations
         if self.final_activation == 'sigmoid':
@@ -155,7 +167,15 @@ class CompactUNet(nn.Module):
         # Ensure variance is positive using softplus
         sigma_sq = F.softplus(log_var) + 1e-6  # Add small epsilon for numerical stability
         
-        return mu, sigma_sq
+        # Process transform predictions
+        x_scale = torch.sigmoid(transform_out[:, 0]) * 0.8 + 0.6  # Range [0.6, 1.4]
+        y_scale = torch.sigmoid(transform_out[:, 1]) * 0.8 + 0.6  # Range [0.6, 1.4]
+        x_offset = torch.tanh(transform_out[:, 2])  # Range [-1, 1]
+        y_offset = torch.tanh(transform_out[:, 3])  # Range [-1, 1]
+        
+        transform_params = torch.stack([x_scale, y_scale, x_offset, y_offset], dim=1)
+        
+        return mu, sigma_sq, transform_params
 
 
 class CompactUNetGAP(nn.Module):
@@ -192,6 +212,15 @@ class CompactUNetGAP(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 32*32*out_channels*2, 1)  # Predict flattened 32x32 patch (mu + sigma^2)
         )
+        
+        # Transform prediction head
+        self.transform_head = nn.Sequential(
+            nn.Conv2d(256, 64, 1),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(64, 4, 1),
+            nn.Flatten()
+        )
     
     def forward(self, x):
         batch_size = x.size(0)
@@ -203,17 +232,20 @@ class CompactUNetGAP(nn.Module):
         x4, _ = self.enc4(x3)   # 9x9x128
         
         # Bottleneck
-        x = self.bottleneck(x4) # 9x9x256
+        bottleneck_out = self.bottleneck(x4) # 9x9x256
         
-        # Global Average Pooling + MLP
-        x = self.gap(x)         # 1x1x256
-        x = self.mlp(x)         # 1x1x(32*32*6)
+        # Global Average Pooling + MLP for image prediction
+        img_features = self.gap(bottleneck_out)         # 1x1x256
+        img_out = self.mlp(img_features)         # 1x1x(32*32*6)
+        
+        # Transform prediction
+        transform_out = self.transform_head(bottleneck_out)  # 4 scalars
         
         # Reshape to 32x32 patch
-        x = x.view(batch_size, 6, 32, 32)  # Shape: (batch_size, 6, 32, 32)
+        img_out = img_out.view(batch_size, 6, 32, 32)  # Shape: (batch_size, 6, 32, 32)
         
         # Split into mu and sigma^2
-        mu, log_var = torch.chunk(x, 2, dim=1)  # Each: (batch_size, 3, 32, 32)
+        mu, log_var = torch.chunk(img_out, 2, dim=1)  # Each: (batch_size, 3, 32, 32)
         
         # Apply activations
         if self.final_activation == 'sigmoid':
@@ -224,7 +256,15 @@ class CompactUNetGAP(nn.Module):
         # Ensure variance is positive using softplus
         sigma_sq = F.softplus(log_var) + 1e-6  # Add small epsilon for numerical stability
         
-        return mu, sigma_sq
+        # Process transform predictions
+        x_scale = torch.sigmoid(transform_out[:, 0]) * 0.8 + 0.6  # Range [0.6, 1.4]
+        y_scale = torch.sigmoid(transform_out[:, 1]) * 0.8 + 0.6  # Range [0.6, 1.4]
+        x_offset = torch.tanh(transform_out[:, 2])  # Range [-1, 1]
+        y_offset = torch.tanh(transform_out[:, 3])  # Range [-1, 1]
+        
+        transform_params = torch.stack([x_scale, y_scale, x_offset, y_offset], dim=1)
+        
+        return mu, sigma_sq, transform_params
 
 
 def count_parameters(model):

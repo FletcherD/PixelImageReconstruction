@@ -16,9 +16,11 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, ConcatDataset
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as F
 import numpy as np
 from tqdm import tqdm
 import wandb
+import math
 
 # Import our modules
 from compact_unet import CompactUNet, CompactUNetGAP, count_parameters, heteroscedastic_loss
@@ -114,64 +116,198 @@ def create_datasets(args) -> tuple:
     return train_dataset, val_dataset
 
 
+def apply_random_transform(image, transform_params):
+    """Apply spatial transformation to input image based on parameters."""
+    x_scale, y_scale, x_offset, y_offset = transform_params
+    
+    # Create affine transformation matrix
+    theta = torch.zeros(1, 2, 3, device=image.device, dtype=image.dtype)
+    theta[0, 0, 0] = x_scale
+    theta[0, 1, 1] = y_scale
+    theta[0, 0, 2] = x_offset
+    theta[0, 1, 2] = y_offset
+    
+    # Apply transformation
+    grid = torch.nn.functional.affine_grid(theta, image.unsqueeze(0).size(), align_corners=False)
+    transformed = torch.nn.functional.grid_sample(image.unsqueeze(0), grid, align_corners=False)
+    
+    return transformed.squeeze(0)
+
+
+def generate_transform_params(batch_size, device):
+    """Generate random transformation parameters for training."""
+    # Half the samples perfectly aligned, half transformed
+    aligned_samples = batch_size // 2
+    transformed_samples = batch_size - aligned_samples
+    
+    # Aligned samples (all zeros)
+    aligned_params = torch.zeros(aligned_samples, 4, device=device)
+    
+    # Transformed samples
+    if transformed_samples > 0:
+        # Random shift in circular pattern (up to 2 pixels)
+        angles = torch.rand(transformed_samples, device=device) * 2 * math.pi
+        distances = torch.rand(transformed_samples, device=device) * 2  # 0-2 pixels
+        x_shift_pixels = distances * torch.cos(angles)
+        y_shift_pixels = distances * torch.sin(angles)
+        
+        # Convert pixel shifts to normalized coordinates (-1 to 1 range for 128x128 input)
+        x_offset = x_shift_pixels / 64  # 2 pixels / 64 = max range
+        y_offset = y_shift_pixels / 64
+        
+        # Random scale (0.8 to 1.2)
+        x_scale = torch.rand(transformed_samples, device=device) * 0.4 + 0.8  # [0.8, 1.2]
+        y_scale = torch.rand(transformed_samples, device=device) * 0.4 + 0.8  # [0.8, 1.2]
+        
+        transformed_params = torch.stack([x_scale, y_scale, x_offset, y_offset], dim=1)
+    else:
+        transformed_params = torch.empty(0, 4, device=device)
+    
+    # Combine and shuffle
+    all_params = torch.cat([aligned_params, transformed_params], dim=0)
+    perm = torch.randperm(batch_size, device=device)
+    return all_params[perm]
+
+
+def transform_loss(pred_transform, true_transform):
+    """Compute loss for transformation parameters."""
+    return torch.nn.functional.mse_loss(pred_transform, true_transform)
+
+
 def train_epoch(model, dataloader, optimizer, device, epoch: int) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
+    total_img_loss = 0.0
+    total_transform_loss = 0.0
     num_batches = len(dataloader)
     
     progress_bar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
     for batch_idx, (inputs, targets) in enumerate(progress_bar):
         inputs, targets = inputs.to(device), targets.to(device)
+        batch_size = inputs.size(0)
+        
+        # Generate random transformation parameters
+        true_transform_params = generate_transform_params(batch_size, device)
+        
+        # Apply transformations to inputs
+        transformed_inputs = []
+        for i in range(batch_size):
+            if torch.allclose(true_transform_params[i], torch.zeros(4, device=device)):
+                # No transformation
+                transformed_inputs.append(inputs[i])
+            else:
+                # Apply transformation
+                transformed_inputs.append(apply_random_transform(inputs[i], true_transform_params[i]))
+        
+        transformed_inputs = torch.stack(transformed_inputs)
         
         optimizer.zero_grad()
-        mu, sigma_sq = model(inputs)
-        loss = heteroscedastic_loss(mu, sigma_sq, targets)
+        mu, sigma_sq, pred_transform_params = model(transformed_inputs)
+        
+        # Image reconstruction loss
+        img_loss = heteroscedastic_loss(mu, sigma_sq, targets)
+        
+        # Transform parameter loss
+        trans_loss = transform_loss(pred_transform_params, true_transform_params)
+        
+        # Combined loss
+        loss = img_loss + 0.1 * trans_loss  # Weight transform loss lower
+        
         loss.backward()
         optimizer.step()
         
         total_loss += loss.item()
-        avg_loss = total_loss / (batch_idx + 1)
+        total_img_loss += img_loss.item()
+        total_transform_loss += trans_loss.item()
         
-        progress_bar.set_postfix({'loss': f'{avg_loss:.6f}'})
+        avg_loss = total_loss / (batch_idx + 1)
+        avg_img_loss = total_img_loss / (batch_idx + 1)
+        avg_trans_loss = total_transform_loss / (batch_idx + 1)
+        
+        progress_bar.set_postfix({
+            'loss': f'{avg_loss:.6f}',
+            'img': f'{avg_img_loss:.6f}',
+            'trans': f'{avg_trans_loss:.6f}'
+        })
         
         # Log batch metrics to wandb
         if wandb.run is not None:
             wandb.log({
                 'batch_loss': loss.item(),
+                'batch_img_loss': img_loss.item(),
+                'batch_transform_loss': trans_loss.item(),
                 'epoch': epoch,
                 'batch': batch_idx
             })
     
-    return {'train_loss': total_loss / num_batches}
+    return {
+        'train_loss': total_loss / num_batches,
+        'train_img_loss': total_img_loss / num_batches,
+        'train_transform_loss': total_transform_loss / num_batches
+    }
 
 
 def validate_epoch(model, dataloader, device, epoch: int) -> Dict[str, float]:
     """Validate for one epoch."""
     model.eval()
     total_loss = 0.0
+    total_img_loss = 0.0
+    total_transform_loss = 0.0
     total_mae = 0.0
     total_uncertainty = 0.0
+    total_transform_mae = 0.0
     num_batches = len(dataloader)
     
     with torch.no_grad():
         for inputs, targets in tqdm(dataloader, desc=f'Val {epoch}'):
             inputs, targets = inputs.to(device), targets.to(device)
+            batch_size = inputs.size(0)
             
-            mu, sigma_sq = model(inputs)
-            loss = heteroscedastic_loss(mu, sigma_sq, targets)
+            # Generate random transformation parameters
+            true_transform_params = generate_transform_params(batch_size, device)
+            
+            # Apply transformations to inputs
+            transformed_inputs = []
+            for i in range(batch_size):
+                if torch.allclose(true_transform_params[i], torch.zeros(4, device=device)):
+                    # No transformation
+                    transformed_inputs.append(inputs[i])
+                else:
+                    # Apply transformation
+                    transformed_inputs.append(apply_random_transform(inputs[i], true_transform_params[i]))
+            
+            transformed_inputs = torch.stack(transformed_inputs)
+            
+            mu, sigma_sq, pred_transform_params = model(transformed_inputs)
+            
+            # Image losses
+            img_loss = heteroscedastic_loss(mu, sigma_sq, targets)
             mae = torch.abs(mu - targets).mean()
             uncertainty = sigma_sq.mean()
             
+            # Transform losses
+            trans_loss = transform_loss(pred_transform_params, true_transform_params)
+            transform_mae = torch.abs(pred_transform_params - true_transform_params).mean()
+            
+            # Combined loss
+            loss = img_loss + 0.1 * trans_loss
+            
             total_loss += loss.item()
+            total_img_loss += img_loss.item()
+            total_transform_loss += trans_loss.item()
             total_mae += mae.item()
             total_uncertainty += uncertainty.item()
+            total_transform_mae += transform_mae.item()
     
     return {
         'val_loss': total_loss / num_batches,
+        'val_img_loss': total_img_loss / num_batches,
+        'val_transform_loss': total_transform_loss / num_batches,
         'val_mae': total_mae / num_batches,
-        'val_uncertainty': total_uncertainty / num_batches
+        'val_uncertainty': total_uncertainty / num_batches,
+        'val_transform_mae': total_transform_mae / num_batches
     }
 
 
@@ -340,7 +476,8 @@ def main():
         
         print(f"Epoch {epoch}: Train Loss: {train_metrics['train_loss']:.6f}, "
               f"Val Loss: {val_metrics['val_loss']:.6f}, Val MAE: {val_metrics['val_mae']:.6f}, "
-              f"Val Uncertainty: {val_metrics['val_uncertainty']:.6f}")
+              f"Val Uncertainty: {val_metrics['val_uncertainty']:.6f}, "
+              f"Transform MAE: {val_metrics['val_transform_mae']:.6f}")
         
         if not args.disable_wandb:
             wandb.log(metrics)
