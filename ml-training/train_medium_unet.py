@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Training script for CompactUNet model using the data synthesis pipeline.
+Training script for MediumUNet model using the data synthesis pipeline.
 Uses both local images and HuggingFace 'nerijs/pixelparti-128-v0.1' dataset.
 Configured for 128x128 input patches with 32x32 center patch prediction.
+
+MediumUNet is a more sophisticated model with ~6.6M parameters vs CompactUNet's ~1.35M.
 """
 
 import os
@@ -23,7 +25,7 @@ import wandb
 import math
 
 # Import our modules
-from compact_unet import CompactUNet, CompactUNetGAP, count_parameters, mse_loss
+from medium_unet import MediumUNet, count_parameters, mse_loss
 from data_synthesis_pipeline import (
     PixelArtDataSynthesizer, 
     PixelArtDataset, 
@@ -119,23 +121,15 @@ def create_datasets(args) -> tuple:
 def apply_random_transform(image, transform_params):
     """Apply spatial transformation to input image based on parameters.
     
-    NOTE: transform_params contains the DESIRED shift amounts:
-    - Positive x_offset means image should appear shifted RIGHT (sampling from left)
-    - Positive y_offset means image should appear shifted DOWN (sampling from up)
-    
-    But affine_grid uses INVERSE transformation:
-    - Positive grid offset samples from RIGHT, making image appear LEFT
-    - So we need to use the transform_params DIRECTLY (they're already inverted)
     """
     x_scale, y_scale, x_offset, y_offset = transform_params
     
     # Create affine transformation matrix
-    # The offsets are already negated in generate_transform_params to account for grid_sample behavior
     theta = torch.zeros(1, 2, 3, device=image.device, dtype=image.dtype)
-    theta[0, 0, 0] = x_scale
-    theta[0, 1, 1] = y_scale
-    theta[0, 0, 2] = x_offset  # Already negated in generate_transform_params
-    theta[0, 1, 2] = y_offset  # Already negated in generate_transform_params
+    theta[0, 0, 0] = torch.exp(x_scale)
+    theta[0, 1, 1] = torch.exp(y_scale)
+    theta[0, 0, 2] = x_offset / 32.0
+    theta[0, 1, 2] = y_offset / 32.0
     
     # Apply transformation
     grid = torch.nn.functional.affine_grid(theta, image.unsqueeze(0).size(), align_corners=False)
@@ -155,22 +149,18 @@ def generate_transform_params(batch_size, device, transform_fraction=0.5):
     
     # Transformed samples
     if transformed_samples > 0:
-        # Random shift in circular pattern (up to 2 pixels)
+        # Random shift in circular pattern (-1 to 1)
         angles = torch.rand(transformed_samples, device=device) * 2 * math.pi
-        distances = torch.rand(transformed_samples, device=device) * 2  # 0-2 pixels
+        distances = torch.rand(transformed_samples, device=device)
         x_shift_pixels = distances * torch.cos(angles)
         y_shift_pixels = distances * torch.sin(angles)
         
-        # Convert pixel shifts to normalized coordinates (-1 to 1 range for 128x128 input)
-        # NOTE: Affine grid coordinates are INVERTED - positive offset moves sampling grid right,
-        # which means the image appears to move LEFT. So we need to NEGATE to get intuitive behavior.
-        # For a 128x128 input, 2 pixels = 2/64 = 1/32 in normalized coordinates
-        x_offset = -x_shift_pixels / 64  # Negative to invert for intuitive direction
-        y_offset = -y_shift_pixels / 64  # Negative to invert for intuitive direction
+        x_offset = x_shift_pixels
+        y_offset = y_shift_pixels
         
-        # Random scale (0.8 to 1.2)
-        x_scale = torch.rand(transformed_samples, device=device) * 0.4 + 0.8  # [0.8, 1.2]
-        y_scale = torch.rand(transformed_samples, device=device) * 0.4 + 0.8  # [0.8, 1.2]
+        # Random scale
+        x_scale = torch.rand(transformed_samples, device=device) * 0.8 - 0.4
+        y_scale = torch.rand(transformed_samples, device=device) * 0.8 - 0.4
         
         transformed_params = torch.stack([x_scale, y_scale, x_offset, y_offset], dim=1)
     else:
@@ -217,6 +207,182 @@ def test_transformation_consistency():
         y_offset = -y_shift / 64
         print(f"- {name:11} (x_shift={x_shift:2}, y_shift={y_shift:2}): x_offset={x_offset:+.3f}, y_offset={y_offset:+.3f}")
     print()
+
+
+def create_validation_image_grid(inputs, targets, transformed_inputs, pred_images, pred_transforms, true_transforms, max_samples=16):
+    """Create a grid of validation images for wandb logging.
+    
+    Args:
+        inputs: Original input images (B, C, H, W)
+        targets: Target center patches (B, C, H, W) 
+        transformed_inputs: Transformed input images (B, C, H, W)
+        pred_images: Predicted center patches (B, C, H, W)
+        pred_transforms: Predicted transform parameters (B, 4)
+        true_transforms: Ground truth transform parameters (B, 4)
+        max_samples: Maximum number of samples to include
+        
+    Returns:
+        wandb.Image objects for logging
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    batch_size = min(inputs.size(0), max_samples)
+    
+    # Create a grid showing: original input center | transformed input center | target | prediction
+    fig, axes = plt.subplots(batch_size, 4, figsize=(16, 4 * batch_size))
+    if batch_size == 1:
+        axes = axes.reshape(1, -1)
+    
+    for i in range(batch_size):
+        # Extract center regions for visualization (32x32 from 128x128)
+        input_center = inputs[i, :, 48:80, 48:80].cpu().permute(1, 2, 0).numpy()
+        transformed_center = transformed_inputs[i, :, 48:80, 48:80].cpu().permute(1, 2, 0).numpy()
+        target_img = targets[i].cpu().permute(1, 2, 0).numpy()
+        pred_img = pred_images[i].cpu().permute(1, 2, 0).numpy()
+        
+        # Clip values to [0, 1] for display
+        input_center = np.clip(input_center, 0, 1)
+        transformed_center = np.clip(transformed_center, 0, 1)
+        target_img = np.clip(target_img, 0, 1)
+        pred_img = np.clip(pred_img, 0, 1)
+        
+        # Extract transform parameters
+        true_t = true_transforms[i].cpu().numpy()
+        pred_t = pred_transforms[i].cpu().numpy()
+        
+        # Original input center
+        axes[i, 0].imshow(input_center)
+        axes[i, 0].set_title(f"Original Center\nSample {i}")
+        axes[i, 0].axis('off')
+        
+        # Transformed input center
+        axes[i, 1].imshow(transformed_center)
+        transform_text = f"True: [{true_t[0]:.2f}, {true_t[1]:.2f}, {true_t[2]:.2f}, {true_t[3]:.2f}]"
+        axes[i, 1].set_title(f"Transformed Input\n{transform_text}")
+        axes[i, 1].axis('off')
+        
+        # Target (ground truth)
+        axes[i, 2].imshow(target_img)
+        axes[i, 2].set_title(f"Target\n(Ground Truth)")
+        axes[i, 2].axis('off')
+        
+        # Prediction
+        axes[i, 3].imshow(pred_img)
+        pred_text = f"Pred: [{pred_t[0]:.2f}, {pred_t[1]:.2f}, {pred_t[2]:.2f}, {pred_t[3]:.2f}]"
+        error = np.abs(pred_t - true_t).mean()
+        axes[i, 3].set_title(f"Prediction\n{pred_text}\nError: {error:.3f}")
+        axes[i, 3].axis('off')
+    
+    plt.tight_layout()
+    
+    # Convert to wandb Image
+    wandb_image = wandb.Image(fig)
+    plt.close(fig)
+    
+    return wandb_image
+
+
+def test_transform_training_samples(model, device, output_dir="debug_samples"):
+    """Test function to output example training samples for debugging transform convergence.
+    
+    Creates training samples with specific transforms to debug why the 4 scalar outputs
+    are failing to converge during training.
+    
+    Args:
+        model: The MediumUNet model to test
+        device: Device to run inference on
+        output_dir: Directory to save debug samples
+    """
+    import os
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create a simple test image (checkerboard pattern)
+    test_image = torch.zeros(3, 128, 128, device=device)
+    # Checkerboard pattern
+    for i in range(0, 128, 8):
+        for j in range(0, 128, 8):
+            if (i // 8 + j // 8) % 2 == 0:
+                test_image[:, i:i+8, j:j+8] = 1.0
+    
+    # Define test transforms
+    test_transforms = [
+        ("zero_transform", [0.0, 0.0, 0.0, 0.0]),  # No transform
+        ("x_offset_neg1", [0.0, 0.0, -1.0, 0.0]),  # x offset -1 (shift right 2 pixels)
+        ("x_offset_pos1", [0.0, 0.0, 1.0, 0.0]),   # x offset +1 (shift left 2 pixels)
+        ("y_offset_neg1", [0.0, 0.0, 0.0, -1.0]),  # y offset -1 (shift down 2 pixels)
+        ("y_offset_pos1", [0.0, 0.0, 0.0, 1.0]),   # y offset +1 (shift up 2 pixels)
+        ("scale_09", [-0.2, -0.2, 0.0, 0.0]),        # Scale 0.9
+        ("scale_11", [0.2, 0.2, 0.0, 0.0]),        # Scale 1.1
+    ]
+    
+    model.eval()
+    with torch.no_grad():
+        for i, (name, transform_params) in enumerate(test_transforms):
+            print(f"\\nTesting {name}: {transform_params}")
+            
+            # Convert to tensor
+            transform_tensor = torch.tensor(transform_params, device=device)
+            
+            # Apply transform to input
+            if torch.allclose(transform_tensor, torch.zeros(4, device=device)):
+                transformed_input = test_image
+            else:
+                transformed_input = apply_random_transform(test_image, transform_tensor)
+            
+            # Get model prediction
+            pred_image, pred_transform = model(transformed_input.unsqueeze(0))
+            pred_image = pred_image.squeeze(0)
+            pred_transform = pred_transform.squeeze(0)
+            
+            print(f"  Ground truth transform: {transform_params}")
+            print(f"  Predicted transform:    {pred_transform.cpu().numpy()}")
+            print(f"  Transform error:        {torch.abs(pred_transform - transform_tensor).cpu().numpy()}")
+            
+            # Save visualizations
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            
+            # Original center crop (32x32 from center of 128x128)
+            original_center = test_image[:, 48:80, 48:80]  # Center 32x32
+            axes[0].imshow(original_center.permute(1, 2, 0).cpu().numpy())
+            axes[0].set_title(f"Original Center\\n(Ground Truth)")
+            axes[0].axis('off')
+            
+            # Transformed input (show center region)
+            transformed_center = transformed_input[:, 48:80, 48:80]
+            axes[1].imshow(transformed_center.permute(1, 2, 0).cpu().numpy())
+            axes[1].set_title(f"Transformed Input Center\\n{name}")
+            axes[1].axis('off')
+            
+            # Model prediction
+            axes[2].imshow(pred_image.permute(1, 2, 0).cpu().numpy())
+            axes[2].set_title(f"Model Prediction\\nTransform: {pred_transform.cpu().numpy()}")
+            axes[2].axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f"{i:02d}_{name}.png"), dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            # Also save individual images
+            def save_tensor_as_image(tensor, filepath):
+                # Convert CHW to HWC and ensure values are in [0,1]
+                img_array = tensor.permute(1, 2, 0).cpu().numpy()
+                img_array = np.clip(img_array, 0, 1)
+                img_pil = Image.fromarray((img_array * 255).astype(np.uint8))
+                img_pil.save(filepath)
+            
+            save_tensor_as_image(original_center, os.path.join(output_dir, f"{i:02d}_{name}_original.png"))
+            save_tensor_as_image(transformed_center, os.path.join(output_dir, f"{i:02d}_{name}_input.png"))
+            save_tensor_as_image(pred_image, os.path.join(output_dir, f"{i:02d}_{name}_pred.png"))
+    
+    print(f"\\nDebug samples saved to {output_dir}/")
+    print("Check the images to verify:")
+    print("1. Transform applications are working correctly")
+    print("2. Model predictions are reasonable")
+    print("3. Transform parameter predictions match ground truth")
 
 
 def train_epoch(model, dataloader, optimizer, device, epoch: int, 
@@ -324,7 +490,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch: int,
 
 def validate_epoch(model, dataloader, device, epoch: int,
                    transform_fraction: float = 0.5, transform_loss_weight: float = 0.1,
-                   training_strategy: str = 'joint') -> Dict[str, float]:
+                   training_strategy: str = 'joint', log_images: bool = False, 
+                   max_image_samples: int = 16) -> Dict[str, float]:
     """Validate for one epoch."""
     model.eval()
     total_loss = 0.0
@@ -335,8 +502,17 @@ def validate_epoch(model, dataloader, device, epoch: int,
     total_transform_mae = 0.0
     num_batches = len(dataloader)
     
+    # For image logging
+    logged_samples = 0
+    sample_inputs = []
+    sample_targets = []
+    sample_transformed_inputs = []
+    sample_pred_images = []
+    sample_pred_transforms = []
+    sample_true_transforms = []
+    
     with torch.no_grad():
-        for inputs, targets in tqdm(dataloader, desc=f'Val {epoch}'):
+        for batch_idx, (inputs, targets) in enumerate(tqdm(dataloader, desc=f'Val {epoch}')):
             inputs, targets = inputs.to(device), targets.to(device)
             batch_size = inputs.size(0)
             
@@ -373,6 +549,40 @@ def validate_epoch(model, dataloader, device, epoch: int,
             total_transform_loss += trans_loss.item()
             total_mae += mae.item()
             total_transform_mae += transform_mae.item()
+            
+            # Collect samples for image logging
+            if log_images and logged_samples < max_image_samples and wandb.run is not None:
+                samples_to_take = min(batch_size, max_image_samples - logged_samples)
+                sample_inputs.append(inputs[:samples_to_take].cpu())
+                sample_targets.append(targets[:samples_to_take].cpu())
+                sample_transformed_inputs.append(torch.stack(transformed_inputs[:samples_to_take]).cpu())
+                sample_pred_images.append(mu[:samples_to_take].cpu())
+                sample_pred_transforms.append(pred_transform_params[:samples_to_take].cpu())
+                sample_true_transforms.append(true_transform_params[:samples_to_take].cpu())
+                logged_samples += samples_to_take
+    
+    # Log validation images to wandb
+    if log_images and logged_samples > 0 and wandb.run is not None:
+        # Concatenate all collected samples
+        all_inputs = torch.cat(sample_inputs, dim=0)
+        all_targets = torch.cat(sample_targets, dim=0)
+        all_transformed_inputs = torch.cat(sample_transformed_inputs, dim=0)
+        all_pred_images = torch.cat(sample_pred_images, dim=0)
+        all_pred_transforms = torch.cat(sample_pred_transforms, dim=0)
+        all_true_transforms = torch.cat(sample_true_transforms, dim=0)
+        
+        # Create validation image grid
+        validation_image = create_validation_image_grid(
+            all_inputs, all_targets, all_transformed_inputs,
+            all_pred_images, all_pred_transforms, all_true_transforms,
+            max_samples=logged_samples
+        )
+        
+        # Log to wandb
+        wandb.log({
+            "validation_samples": validation_image,
+            "epoch": epoch
+        })
     
     return {
         'val_loss': total_loss / num_batches,
@@ -403,7 +613,7 @@ def load_checkpoint(model, optimizer, filepath, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train CompactUNet for single pixel prediction')
+    parser = argparse.ArgumentParser(description='Train MediumUNet for patch prediction with transform detection')
     
     # Dataset arguments
     parser.add_argument('--source_images_dir', type=str, 
@@ -442,10 +652,8 @@ def main():
     parser.add_argument('--transform_warmup_epochs', type=int, default=0,
                        help='Number of epochs to train only transforms before joint training')
     
-    # Model arguments
-    parser.add_argument('--model_type', type=str, default='standard', 
-                       choices=['standard', 'gap'],
-                       help='Model type: standard or gap (Global Average Pooling)')
+    # Model arguments (MediumUNet only has one type)
+    # Removed model_type since MediumUNet doesn't have a GAP variant
     parser.add_argument('--dropout', type=float, default=0.1,
                        help='Dropout rate')
     parser.add_argument('--use_transpose', action='store_true', default=True,
@@ -462,16 +670,24 @@ def main():
                        help='Number of data loader workers')
     parser.add_argument('--save_every', type=int, default=1,
                        help='Save checkpoint every N epochs')
-    parser.add_argument('--output_dir', type=str, default='checkpoints-compact-unet',
+    parser.add_argument('--output_dir', type=str, default='checkpoints-medium-unet',
                        help='Output directory for checkpoints')
     
     # Wandb arguments
-    parser.add_argument('--wandb_project', type=str, default='compact-unet',
+    parser.add_argument('--wandb_project', type=str, default='medium-unet',
                        help='Wandb project name')
     parser.add_argument('--wandb_run_name', type=str, default=None,
                        help='Wandb run name')
     parser.add_argument('--disable_wandb', action='store_true',
                        help='Disable wandb logging')
+    
+    # Debug arguments
+    parser.add_argument('--test_transforms', action='store_true',
+                       help='Run transform debugging test and exit')
+    parser.add_argument('--log_validation_images', action='store_true',
+                       help='Log validation images to wandb')
+    parser.add_argument('--max_validation_images', type=int, default=16,
+                       help='Maximum number of validation images to log per epoch')
     
     args = parser.parse_args()
     
@@ -514,20 +730,21 @@ def main():
     )
     
     # Create model
-    if args.model_type == 'standard':
-        model = CompactUNet(
-            dropout=args.dropout,
-            use_transpose=args.use_transpose,
-            final_activation=args.final_activation
-        )
-    else:  # gap
-        model = CompactUNetGAP(
-            dropout=args.dropout,
-            final_activation=args.final_activation
-        )
+    model = MediumUNet(
+        dropout=args.dropout,
+        use_transpose=args.use_transpose,
+        final_activation=args.final_activation
+    )
     
     model = model.to(device)
     print(f"Model parameters: {count_parameters(model):,}")
+    
+    # Run transform debugging test if requested
+    if args.test_transforms:
+        print("Running transform debugging test...")
+        test_transform_training_samples(model, device, "debug_transform_samples")
+        print("Transform debugging test completed. Exiting.")
+        return
     
     # Create optimizer (using heteroscedastic_loss function directly)
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -584,7 +801,9 @@ def main():
         val_metrics = validate_epoch(model, val_loader, device, epoch,
                                    transform_fraction=args.transform_fraction,
                                    transform_loss_weight=args.transform_loss_weight,
-                                   training_strategy=args.training_strategy)
+                                   training_strategy=args.training_strategy,
+                                   log_images=args.log_validation_images and not args.disable_wandb,
+                                   max_image_samples=args.max_validation_images)
         
         # Update learning rate
         scheduler.step(val_metrics['val_loss'])

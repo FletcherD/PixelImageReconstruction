@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Patch-based inference script for image reconstruction using CompactUNet.
+Patch-based inference script for image reconstruction using MediumUNet.
 
-Takes a large image and reconstructs it using the trained CompactUNet model.
+Takes a large image and reconstructs it using the trained MediumUNet model.
 The model takes 128x128 patches and outputs 32x32 patches.
 Uses non-overlapping 32x32 windows for efficient reconstruction.
 """
@@ -17,7 +17,7 @@ import sys
 import os
 import pandas as pd
 
-from compact_unet import CompactUNet, CompactUNetGAP
+from medium_unet import MediumUNet
 
 
 def enable_dropout(model):
@@ -34,12 +34,9 @@ def disable_dropout(model):
             module.eval()
 
 
-def load_model(checkpoint_path: str, device: torch.device, use_gap: bool = False):
-    """Load the trained CompactUNet model from checkpoint."""
-    if use_gap:
-        model = CompactUNetGAP()
-    else:
-        model = CompactUNet()
+def load_model(checkpoint_path: str, device: torch.device):
+    """Load the trained MediumUNet model from checkpoint."""
+    model = MediumUNet()
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
@@ -534,12 +531,12 @@ def postprocess_output(output: np.ndarray) -> np.ndarray:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Patch-based inference for image reconstruction using CompactUNet')
+    parser = argparse.ArgumentParser(description='Patch-based inference for image reconstruction using MediumUNet')
     parser.add_argument('input_image', type=str, help='Path to input image')
-    parser.add_argument('--model', type=str, default='checkpoints-compact-unet-32-128/final_model.pth',
+    parser.add_argument('--model', type=str, default='checkpoints-medium-unet/best_model.pth',
                        help='Path to model checkpoint')
     parser.add_argument('--output', type=str, help='Output image path (default: input_reconstructed.png)')
-    parser.add_argument('--use-gap', action='store_true', help='Use GAP variant of the model')
+    # Removed --use-gap since MediumUNet doesn't have a GAP variant
     parser.add_argument('--patch-size', type=int, default=32, help='Output patch size')
     parser.add_argument('--window-size', type=int, default=128, help='Input window size')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for inference')
@@ -576,7 +573,7 @@ def main():
         return
     
     print(f"Loading model from: {args.model}")
-    model = load_model(args.model, device, use_gap=args.use_gap)
+    model = load_model(args.model, device)
     
     # Determine if we need to collect transforms
     collect_transforms = args.print_transforms or args.save_transforms
@@ -667,7 +664,7 @@ def main():
     print(f"\nStatistics:")
     print(f"Input resolution: {image_array.shape[1]}x{image_array.shape[0]}")
     print(f"Output resolution: {output_image.shape[1]}x{output_image.shape[0]}")
-    print(f"Model: {'CompactUNetGAP' if args.use_gap else 'CompactUNet'}")
+    print(f"Model: MediumUNet")
     print(f"Patch size: {args.patch_size}x{args.patch_size}")
     print(f"Window size: {args.window_size}x{args.window_size}")
     if args.mc_dropout:

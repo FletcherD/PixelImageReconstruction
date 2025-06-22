@@ -123,8 +123,8 @@ class CompactUNet(nn.Module):
         # 16x16 → 32x32 (with skip from enc3: 64 channels)
         self.dec3 = DecoderBlock(128, 64, 64, dropout=dropout, use_transpose=use_transpose)
         
-        # Final output layer - outputs 2x channels (mu + sigma^2) + 4 transform params
-        self.final_conv = nn.Conv2d(64, out_channels * 2, 1)
+        # Final output layer - outputs only mu (no variance)
+        self.final_conv = nn.Conv2d(64, out_channels, 1)
         
         # Transform prediction head - outputs 4 scalars (x_scale, y_scale, x_offset, y_offset)
         self.transform_head = nn.Sequential(
@@ -150,22 +150,16 @@ class CompactUNet(nn.Module):
         dec_out = self.dec3(dec_out, skip3)     # 16x16 → 32x32, concat with skip3
         
         # Final convolution for image prediction
-        img_out = self.final_conv(dec_out)      # 32x32x6 (3 for mu, 3 for sigma^2)
+        mu = self.final_conv(dec_out)      # 32x32x3 (only mu, no variance)
         
         # Transform prediction
         transform_out = self.transform_head(dec_out)  # 4 scalars
         
-        # Split image output into mu and sigma^2
-        mu, log_var = torch.chunk(img_out, 2, dim=1)  # Each: 32x32x3
-        
-        # Apply activations
+        # Apply activation to image output
         if self.final_activation == 'sigmoid':
             mu = torch.sigmoid(mu)
         elif self.final_activation == 'tanh':
             mu = torch.tanh(mu)
-        
-        # Ensure variance is positive using softplus
-        sigma_sq = F.softplus(log_var) + 1e-6  # Add small epsilon for numerical stability
         
         # Process transform predictions
         x_scale = torch.sigmoid(transform_out[:, 0]) * 0.8 + 0.6  # Range [0.6, 1.4]
@@ -175,7 +169,7 @@ class CompactUNet(nn.Module):
         
         transform_params = torch.stack([x_scale, y_scale, x_offset, y_offset], dim=1)
         
-        return mu, sigma_sq, transform_params
+        return mu, transform_params
 
 
 class CompactUNetGAP(nn.Module):
@@ -210,7 +204,7 @@ class CompactUNetGAP(nn.Module):
             nn.Dropout2d(dropout),
             nn.Conv2d(128, 64, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 32*32*out_channels*2, 1)  # Predict flattened 32x32 patch (mu + sigma^2)
+            nn.Conv2d(64, 32*32*out_channels, 1)  # Predict flattened 32x32 patch (only mu)
         )
         
         # Transform prediction head
@@ -236,25 +230,19 @@ class CompactUNetGAP(nn.Module):
         
         # Global Average Pooling + MLP for image prediction
         img_features = self.gap(bottleneck_out)         # 1x1x256
-        img_out = self.mlp(img_features)         # 1x1x(32*32*6)
+        img_out = self.mlp(img_features)         # 1x1x(32*32*3)
         
         # Transform prediction
         transform_out = self.transform_head(bottleneck_out)  # 4 scalars
         
         # Reshape to 32x32 patch
-        img_out = img_out.view(batch_size, 6, 32, 32)  # Shape: (batch_size, 6, 32, 32)
-        
-        # Split into mu and sigma^2
-        mu, log_var = torch.chunk(img_out, 2, dim=1)  # Each: (batch_size, 3, 32, 32)
+        mu = img_out.view(batch_size, 3, 32, 32)  # Shape: (batch_size, 3, 32, 32)
         
         # Apply activations
         if self.final_activation == 'sigmoid':
             mu = torch.sigmoid(mu)
         elif self.final_activation == 'tanh':
             mu = torch.tanh(mu)
-        
-        # Ensure variance is positive using softplus
-        sigma_sq = F.softplus(log_var) + 1e-6  # Add small epsilon for numerical stability
         
         # Process transform predictions
         x_scale = torch.sigmoid(transform_out[:, 0]) * 0.8 + 0.6  # Range [0.6, 1.4]
@@ -264,7 +252,7 @@ class CompactUNetGAP(nn.Module):
         
         transform_params = torch.stack([x_scale, y_scale, x_offset, y_offset], dim=1)
         
-        return mu, sigma_sq, transform_params
+        return mu, transform_params
 
 
 def count_parameters(model):
@@ -272,25 +260,18 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def heteroscedastic_loss(mu, sigma_sq, target):
+def mse_loss(mu, target):
     """
-    Heteroscedastic loss function for uncertainty-aware training.
+    Simple MSE loss function for image reconstruction.
     
     Args:
-        mu: Predicted mean values (B, C, H, W)
-        sigma_sq: Predicted variance values (B, C, H, W)
+        mu: Predicted values (B, C, H, W)
         target: Ground truth values (B, C, H, W)
     
     Returns:
         Loss value
     """
-    # Negative log-likelihood for Gaussian distribution
-    # L = 0.5 * (log(2π) + log(σ²) + (y - μ)² / σ²)
-    # We omit the constant log(2π) term
-    reconstruction_loss = (target - mu) ** 2
-    uncertainty_loss = 0.5 * (torch.log(sigma_sq) + reconstruction_loss / sigma_sq)
-    
-    return torch.mean(uncertainty_loss)
+    return torch.nn.functional.mse_loss(mu, target)
 
 
 def test_model():
@@ -303,27 +284,27 @@ def test_model():
     print(f"CompactUNet parameters: {count_parameters(model):,}")
     
     with torch.no_grad():
-        mu, sigma_sq = model(x)
+        mu, transform_params = model(x)
     
-    print(f"Mu shape: {mu.shape}, Sigma² shape: {sigma_sq.shape}")
+    print(f"Mu shape: {mu.shape}, Transform params shape: {transform_params.shape}")
     print(f"Mu range: [{mu.min():.3f}, {mu.max():.3f}]")
-    print(f"Sigma² range: [{sigma_sq.min():.3f}, {sigma_sq.max():.3f}]")
+    print(f"Transform params range: [{transform_params.min():.3f}, {transform_params.max():.3f}]")
     
     # Test loss function
     target = torch.randn_like(mu)
-    loss = heteroscedastic_loss(mu, sigma_sq, target)
-    print(f"Heteroscedastic loss: {loss:.3f}")
+    loss = mse_loss(mu, target)
+    print(f"MSE loss: {loss:.3f}")
     
     # Test CompactUNetGAP
     model_gap = CompactUNetGAP()
     print(f"\nCompactUNetGAP parameters: {count_parameters(model_gap):,}")
     
     with torch.no_grad():
-        mu_gap, sigma_sq_gap = model_gap(x)
+        mu_gap, transform_params_gap = model_gap(x)
     
-    print(f"GAP Mu shape: {mu_gap.shape}, GAP Sigma² shape: {sigma_sq_gap.shape}")
+    print(f"GAP Mu shape: {mu_gap.shape}, GAP Transform params shape: {transform_params_gap.shape}")
     print(f"GAP Mu range: [{mu_gap.min():.3f}, {mu_gap.max():.3f}]")
-    print(f"GAP Sigma² range: [{sigma_sq_gap.min():.3f}, {sigma_sq_gap.max():.3f}]")
+    print(f"GAP Transform params range: [{transform_params_gap.min():.3f}, {transform_params_gap.max():.3f}]")
 
 
 if __name__ == "__main__":
