@@ -154,7 +154,6 @@ class ScaleOffsetInference:
                     scale, offset = self.model.predict_transform_params(patch_tensor)
 
                     scale *= -1.0
-                    offset *= -1.0
                     
                     all_outputs.append(output.cpu().numpy()[0])
                     all_scales.append(scale.cpu().numpy()[0])
