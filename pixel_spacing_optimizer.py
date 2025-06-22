@@ -177,8 +177,9 @@ def rescale_image_to_target_spacing(image, pixel_spacing_h, pixel_spacing_v, tar
     v_scale_factor = target_spacing / pixel_spacing_v
 
     # Calculate output dimensions
-    output_width = int(image.size[0] * h_scale_factor)
-    output_height = int(image.size[1] * v_scale_factor)
+    output_width = int(image.size[0] * h_scale_factor * y_scale)
+    output_height = int(image.size[1] * v_scale_factor* x_scale)
+
 
     return image.resize((output_width, output_height))
 

@@ -81,45 +81,151 @@ class ScaleOffsetInference:
         
         return tensor
     
-    def predict_single(self, image: Union[str, Path, Image.Image]) -> dict:
+    def extract_patches(self, image: Image.Image, patch_size: int = None, overlap: float = 0.5) -> List[torch.Tensor]:
         """
-        Predict scale and offset for a single image.
+        Extract overlapping patches from an image for patch-based inference.
+        
+        Args:
+            image: PIL Image
+            patch_size: Size of patches (defaults to model input size)
+            overlap: Overlap ratio between patches (0.0 to 1.0)
+            
+        Returns:
+            List of patch tensors
+        """
+        if patch_size is None:
+            patch_size = self.input_size
+            
+        # Convert to tensor but don't resize the whole image
+        tensor = transforms.ToTensor()(image)
+        _, H, W = tensor.shape
+        
+        # Calculate step size based on overlap
+        step_size = int(patch_size * (1 - overlap))
+        if step_size < 1:
+            step_size = 1
+        
+        patches = []
+        
+        # Extract patches with sliding window
+        for y in range(0, H - patch_size + 1, step_size):
+            for x in range(0, W - patch_size + 1, step_size):
+                patch = tensor[:, y:y+patch_size, x:x+patch_size]
+                patches.append(patch.unsqueeze(0))  # Add batch dimension
+        
+        # If image is smaller than patch size, just resize the whole image
+        if not patches:
+            resized_tensor = transforms.Resize((patch_size, patch_size))(tensor)
+            patches.append(resized_tensor.unsqueeze(0))
+        
+        return patches
+    
+    def predict_single(self, image: Union[str, Path, Image.Image], use_patches: bool = True) -> dict:
+        """
+        Predict scale and offset for a single image using patch-based inference.
         
         Args:
             image: Image path or PIL Image
+            use_patches: Whether to use patch-based inference or single image inference
             
         Returns:
-            Dictionary with prediction results
+            Dictionary with prediction results including statistics across patches
         """
-        # Preprocess
-        input_tensor = self.preprocess_image(image).to(self.device)
+        # Load image if path provided
+        if isinstance(image, (str, Path)):
+            pil_image = Image.open(image).convert('RGB')
+        else:
+            pil_image = image
         
-        # Inference
-        with torch.no_grad():
-            output = self.model(input_tensor)
-            scale, offset = self.model.predict_transform_params(input_tensor)
-        
-        # Convert to numpy
-        output_np = output.cpu().numpy()[0]  # Remove batch dimension
-        scale_np = scale.cpu().numpy()[0]
-        offset_np = offset.cpu().numpy()[0]
-        
-        return {
-            'raw_output': output_np,
-            'scale_x': float(scale_np[0]),
-            'scale_y': float(scale_np[1]),
-            'offset_x': float(offset_np[0]),
-            'offset_y': float(offset_np[1]),
-            'scale': scale_np,
-            'offset': offset_np
-        }
+        if use_patches:
+            # Extract patches
+            patches = self.extract_patches(pil_image)
+            
+            all_outputs = []
+            all_scales = []
+            all_offsets = []
+            
+            # Process each patch
+            with torch.no_grad():
+                for patch in patches:
+                    patch_tensor = patch.to(self.device)
+                    
+                    output = self.model(patch_tensor)
+                    scale, offset = self.model.predict_transform_params(patch_tensor)
+                    
+                    all_outputs.append(output.cpu().numpy()[0])
+                    all_scales.append(scale.cpu().numpy()[0])
+                    all_offsets.append(offset.cpu().numpy()[0])
+            
+            # Convert to numpy arrays for statistics
+            all_outputs = np.array(all_outputs)  # Shape: (n_patches, 4)
+            all_scales = np.array(all_scales)    # Shape: (n_patches, 2)
+            all_offsets = np.array(all_offsets)  # Shape: (n_patches, 2)
+            
+            # Calculate statistics
+            mean_output = np.mean(all_outputs, axis=0)
+            std_output = np.std(all_outputs, axis=0)
+            
+            mean_scale = np.mean(all_scales, axis=0)
+            std_scale = np.std(all_scales, axis=0)
+            
+            mean_offset = np.mean(all_offsets, axis=0)
+            std_offset = np.std(all_offsets, axis=0)
+            
+            return {
+                'raw_output': mean_output,
+                'raw_output_std': std_output,
+                'scale_x': float(mean_scale[0]),
+                'scale_y': float(mean_scale[1]),
+                'scale_x_std': float(std_scale[0]),
+                'scale_y_std': float(std_scale[1]),
+                'offset_x': float(mean_offset[0]),
+                'offset_y': float(mean_offset[1]),
+                'offset_x_std': float(std_offset[0]),
+                'offset_y_std': float(std_offset[1]),
+                'scale': mean_scale,
+                'offset': mean_offset,
+                'scale_std': std_scale,
+                'offset_std': std_offset,
+                'num_patches': len(patches),
+                'all_predictions': {
+                    'scales': all_scales.tolist(),
+                    'offsets': all_offsets.tolist(),
+                    'raw_outputs': all_outputs.tolist()
+                }
+            }
+        else:
+            # Original single-image inference
+            input_tensor = self.preprocess_image(pil_image).to(self.device)
+            
+            # Inference
+            with torch.no_grad():
+                output = self.model(input_tensor)
+                scale, offset = self.model.predict_transform_params(input_tensor)
+            
+            # Convert to numpy
+            output_np = output.cpu().numpy()[0]  # Remove batch dimension
+            scale_np = scale.cpu().numpy()[0]
+            offset_np = offset.cpu().numpy()[0]
+            
+            return {
+                'raw_output': output_np,
+                'scale_x': float(scale_np[0]),
+                'scale_y': float(scale_np[1]),
+                'offset_x': float(offset_np[0]),
+                'offset_y': float(offset_np[1]),
+                'scale': scale_np,
+                'offset': offset_np,
+                'num_patches': 1
+            }
     
-    def predict_batch(self, images: List[Union[str, Path, Image.Image]]) -> List[dict]:
+    def predict_batch(self, images: List[Union[str, Path, Image.Image]], use_patches: bool = True) -> List[dict]:
         """
         Predict scale and offset for a batch of images.
         
         Args:
             images: List of image paths or PIL Images
+            use_patches: Whether to use patch-based inference
             
         Returns:
             List of prediction dictionaries
@@ -128,7 +234,7 @@ class ScaleOffsetInference:
         
         for image in tqdm(images, desc="Processing images"):
             try:
-                result = self.predict_single(image)
+                result = self.predict_single(image, use_patches=use_patches)
                 result['image'] = str(image) if isinstance(image, (str, Path)) else "PIL_Image"
                 results.append(result)
             except Exception as e:
@@ -143,7 +249,8 @@ class ScaleOffsetInference:
     def predict_directory(self, 
                          input_dir: str, 
                          output_file: Optional[str] = None,
-                         image_extensions: List[str] = None) -> List[dict]:
+                         image_extensions: List[str] = None,
+                         use_patches: bool = True) -> List[dict]:
         """
         Predict scale and offset for all images in a directory.
         
@@ -151,6 +258,7 @@ class ScaleOffsetInference:
             input_dir: Input directory containing images
             output_file: Optional output file to save results
             image_extensions: List of image extensions to process
+            use_patches: Whether to use patch-based inference
             
         Returns:
             List of prediction dictionaries
@@ -171,7 +279,7 @@ class ScaleOffsetInference:
         print(f"Found {len(image_files)} images")
         
         # Process images
-        results = self.predict_batch(image_files)
+        results = self.predict_batch(image_files, use_patches=use_patches)
         
         # Save results if requested
         if output_file:
@@ -293,6 +401,14 @@ def main():
     parser.add_argument("--max_visualizations", type=int, default=20,
                        help="Maximum number of visualizations to create")
     
+    # Inference arguments
+    parser.add_argument("--use_patches", action="store_true", default=True,
+                       help="Use patch-based inference (default: True)")
+    parser.add_argument("--no_patches", action="store_true",
+                       help="Use single-image inference instead of patches")
+    parser.add_argument("--patch_overlap", type=float, default=0.5,
+                       help="Patch overlap ratio (0.0 to 1.0)")
+    
     # System arguments
     parser.add_argument("--device", type=str, default="auto",
                        help="Inference device (cpu, cuda, auto)")
@@ -316,28 +432,43 @@ def main():
         input_size=args.input_size
     )
     
+    # Determine patch usage
+    use_patches = args.use_patches and not args.no_patches
+    
     results = []
     
     # Process single image
     if args.image:
         print(f"Processing single image: {args.image}")
-        result = inference.predict_single(args.image)
+        if use_patches:
+            print(f"Using patch-based inference with {args.patch_overlap:.1f} overlap")
+        else:
+            print("Using single-image inference")
+        result = inference.predict_single(args.image, use_patches=use_patches)
         result['image'] = args.image
         results.append(result)
         
         # Print results
         print(f"\nPrediction for {args.image}:")
-        print(f"Scale X: {result['scale_x']:.4f}")
-        print(f"Scale Y: {result['scale_y']:.4f}")
-        print(f"Offset X: {result['offset_x']:.4f}")
-        print(f"Offset Y: {result['offset_y']:.4f}")
+        if 'num_patches' in result and result['num_patches'] > 1:
+            print(f"Number of patches: {result['num_patches']}")
+            print(f"Scale X: {result['scale_x']:.4f} ± {result.get('scale_x_std', 0):.4f}")
+            print(f"Scale Y: {result['scale_y']:.4f} ± {result.get('scale_y_std', 0):.4f}")
+            print(f"Offset X: {result['offset_x']:.4f} ± {result.get('offset_x_std', 0):.4f}")
+            print(f"Offset Y: {result['offset_y']:.4f} ± {result.get('offset_y_std', 0):.4f}")
+        else:
+            print(f"Scale X: {result['scale_x']:.4f}")
+            print(f"Scale Y: {result['scale_y']:.4f}")
+            print(f"Offset X: {result['offset_x']:.4f}")
+            print(f"Offset Y: {result['offset_y']:.4f}")
     
     # Process directory
     if args.input_dir:
         print(f"Processing directory: {args.input_dir}")
         dir_results = inference.predict_directory(
             input_dir=args.input_dir,
-            output_file=args.output_file
+            output_file=args.output_file,
+            use_patches=use_patches
         )
         results.extend(dir_results)
     
@@ -347,7 +478,7 @@ def main():
         with open(args.image_list, 'r') as f:
             image_paths = [line.strip() for line in f if line.strip()]
         
-        list_results = inference.predict_batch(image_paths)
+        list_results = inference.predict_batch(image_paths, use_patches=use_patches)
         results.extend(list_results)
     
     # Save results
