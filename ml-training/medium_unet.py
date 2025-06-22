@@ -290,8 +290,8 @@ class MediumUNet(nn.Module):
             mu = torch.tanh(mu)
         
         # Process transform predictions
-        x_scale = torch.sigmoid(transform_out[:, 0]) * 0.8 + 0.6  # Range [0.6, 1.4]
-        y_scale = torch.sigmoid(transform_out[:, 1]) * 0.8 + 0.6  # Range [0.6, 1.4]
+        x_scale = torch.tanh(transform_out[:, 0])  # Range [-1, 1]
+        y_scale = torch.tanh(transform_out[:, 1])  # Range [-1, 1]
         x_offset = torch.tanh(transform_out[:, 2])  # Range [-1, 1]
         y_offset = torch.tanh(transform_out[:, 3])  # Range [-1, 1]
         

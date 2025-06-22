@@ -30,17 +30,23 @@ class PixelArtDataSynthesizer:
                  crop_size: int = 33,
                  input_size: int = 128,
                  target_size: int = 1,
+                 complexity_threshold: float = 10.0,
+                 max_retries: int = 10,
                  seed: Optional[int] = None):
         """
         Args:
             crop_size: Size of the square crop from source images
             input_size: Size of the final input image
             target_size: Size of the target patch (1 for center pixel, 32 for center patch)
+            complexity_threshold: Minimum standard deviation for image complexity
+            max_retries: Maximum attempts to find a complex enough crop
             seed: Random seed for reproducibility
         """
         self.crop_size = crop_size
         self.input_size = input_size
         self.target_size = target_size
+        self.complexity_threshold = complexity_threshold
+        self.max_retries = max_retries
         
         if seed is not None:
             random.seed(seed)
@@ -64,6 +70,20 @@ class PixelArtDataSynthesizer:
         
         return image.crop((left, top, left + self.crop_size, top + self.crop_size))
     
+    def is_image_too_simple(self, image: Image.Image, threshold: Optional[float] = None) -> bool:
+        """Check if image has too little variation (almost all one color)."""
+        if threshold is None:
+            threshold = self.complexity_threshold
+            
+        # Convert to numpy array
+        img_array = np.array(image)
+        
+        # Calculate standard deviation across all channels
+        std_dev = np.std(img_array)
+        
+        # Return True if std dev is below threshold (too simple)
+        return std_dev < threshold
+    
     def posterize_image(self, image: Image.Image) -> Image.Image:
         """Posterize image to random number of colors between 8 and 64."""
         num_colors = random.randint(4, 64)
@@ -80,19 +100,15 @@ class PixelArtDataSynthesizer:
         scale_x = base_scale * random.uniform(0.9, 1.1)  # Allow slight variation
         scale_y = base_scale * random.uniform(0.9, 1.1)
         
-        # Random interpolation method
-        interpolation_methods = [Image.NEAREST, Image.BILINEAR, Image.LANCZOS]
-        interpolation = random.choice(interpolation_methods)
-        
         width, height = image.size
         new_width = int(width * scale_x)
         new_height = int(height * scale_y)
         
-        return image.resize((new_width, new_height), interpolation)
+        return image.resize((new_width, new_height), Image.NEAREST)
     
     def apply_jpeg_compression(self, image: Image.Image) -> Image.Image:
         """Apply JPEG compression with quality between 70-95."""
-        quality = random.randint(70, 95)
+        quality = random.randint(85, 99)
         
         # Save to bytes buffer with JPEG compression
         buffer = io.BytesIO()
@@ -129,8 +145,17 @@ class PixelArtDataSynthesizer:
         Returns:
             Tuple of (degraded_input, ground_truth_patch)
         """
-        # Step 1: Random crop
-        cropped = self.random_crop(source_image)
+        # Step 1: Random crop with complexity checking
+        for attempt in range(self.max_retries):
+            cropped = self.random_crop(source_image)
+            
+            # Check if the cropped region is too simple
+            if not self.is_image_too_simple(cropped):
+                break
+        else:
+            # If all attempts failed, use the last crop anyway
+            # This prevents infinite loops with very simple source images
+            pass
         
         # Step 2: Extract center region (this becomes our ground truth)
         ground_truth = self.extract_center_region(cropped)

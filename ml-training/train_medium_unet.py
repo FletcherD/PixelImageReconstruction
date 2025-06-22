@@ -126,8 +126,8 @@ def apply_random_transform(image, transform_params):
     
     # Create affine transformation matrix
     theta = torch.zeros(1, 2, 3, device=image.device, dtype=image.dtype)
-    theta[0, 0, 0] = torch.exp(x_scale)
-    theta[0, 1, 1] = torch.exp(y_scale)
+    theta[0, 0, 0] = torch.exp(x_scale * 0.4 - 0.2)
+    theta[0, 1, 1] = torch.exp(y_scale * 0.4 - 0.2)
     theta[0, 0, 2] = x_offset / 32.0
     theta[0, 1, 2] = y_offset / 32.0
     
@@ -159,8 +159,8 @@ def generate_transform_params(batch_size, device, transform_fraction=0.5):
         y_offset = y_shift_pixels
         
         # Random scale
-        x_scale = torch.rand(transformed_samples, device=device) * 0.8 - 0.4
-        y_scale = torch.rand(transformed_samples, device=device) * 0.8 - 0.4
+        x_scale = torch.rand(transformed_samples, device=device) * 2 - 1
+        y_scale = torch.rand(transformed_samples, device=device) * 2 - 1
         
         transformed_params = torch.stack([x_scale, y_scale, x_offset, y_offset], dim=1)
     else:
@@ -555,7 +555,7 @@ def validate_epoch(model, dataloader, device, epoch: int,
                 samples_to_take = min(batch_size, max_image_samples - logged_samples)
                 sample_inputs.append(inputs[:samples_to_take].cpu())
                 sample_targets.append(targets[:samples_to_take].cpu())
-                sample_transformed_inputs.append(torch.stack(transformed_inputs[:samples_to_take]).cpu())
+                sample_transformed_inputs.append(transformed_inputs[:samples_to_take].cpu())
                 sample_pred_images.append(mu[:samples_to_take].cpu())
                 sample_pred_transforms.append(pred_transform_params[:samples_to_take].cpu())
                 sample_true_transforms.append(true_transform_params[:samples_to_take].cpu())
