@@ -22,7 +22,6 @@ import torchvision.transforms.functional as F
 import numpy as np
 from tqdm import tqdm
 import wandb
-import math
 
 # Import our modules
 from scale_offset_model import ScaleOffsetDetector, ScaleOffsetLoss
@@ -57,9 +56,8 @@ def get_device():
 def create_datasets(args) -> tuple:
     """Create training and validation datasets."""
     synthesizer = PixelArtDataSynthesizer(
-        crop_size=33, 
+        target_size=32,
         input_size=128, 
-        target_size=1,  # Not used for scale/offset detection
         transform_fraction=args.transform_fraction,
         seed=args.seed
     )
@@ -75,9 +73,8 @@ def create_datasets(args) -> tuple:
             synthesizer=synthesizer,
             split='train',
             streaming=args.hf_streaming,
-            crop_size=33,
+            target_size=32,
             input_size=128,
-            target_size=1,
             transform_fraction=args.transform_fraction
         )
         datasets.append(hf_dataset)
@@ -89,9 +86,8 @@ def create_datasets(args) -> tuple:
             source_images_dir=args.source_images_dir,
             num_samples=args.local_samples,
             synthesizer=synthesizer,
-            crop_size=33,
+            target_size=32,
             input_size=128,
-            target_size=1,
             transform_fraction=args.transform_fraction
         )
         datasets.append(local_dataset)
@@ -120,76 +116,20 @@ def create_datasets(args) -> tuple:
     return train_dataset, val_dataset
 
 
-def apply_random_transform(image, transform_params):
-    """Apply spatial transformation to input image based on parameters.
-    
-    Same transformation logic as train_medium_unet.py
-    """
-    x_scale, y_scale, x_offset, y_offset = transform_params
-    
-    # Create affine transformation matrix
-    theta = torch.zeros(1, 2, 3, device=image.device, dtype=image.dtype)
-    theta[0, 0, 0] = torch.exp(x_scale * 0.2)
-    theta[0, 1, 1] = torch.exp(y_scale * 0.2)
-    theta[0, 0, 2] = x_offset / 32.0
-    theta[0, 1, 2] = y_offset / 32.0
-    
-    # Apply transformation
-    grid = torch.nn.functional.affine_grid(theta, image.unsqueeze(0).size(), align_corners=False)
-    transformed = torch.nn.functional.grid_sample(image.unsqueeze(0), grid, align_corners=False)
-    
-    return transformed.squeeze(0)
 
 
-def generate_transform_params(batch_size, device, transform_fraction=0.5):
-    """Generate random transformation parameters for training.
-    
-    Same parameter generation logic as train_medium_unet.py
-    """
-    # Control fraction of transformed samples
-    transformed_samples = int(batch_size * transform_fraction)
-    aligned_samples = batch_size - transformed_samples
-    
-    # Aligned samples (all zeros)
-    aligned_params = torch.zeros(aligned_samples, 4, device=device)
-    
-    # Transformed samples
-    if transformed_samples > 0:
-        # Random shift in circular pattern (-1 to 1)
-        angles = torch.rand(transformed_samples, device=device) * 2 * math.pi
-        distances = torch.rand(transformed_samples, device=device)
-        x_shift_pixels = distances * torch.cos(angles)
-        y_shift_pixels = distances * torch.sin(angles)
-        
-        x_offset = x_shift_pixels
-        y_offset = y_shift_pixels
-        
-        # Random scale
-        x_scale = torch.rand(transformed_samples, device=device) * 2 - 1
-        y_scale = torch.rand(transformed_samples, device=device) * 2 - 1
-        
-        transformed_params = torch.stack([x_scale, y_scale, x_offset, y_offset], dim=1)
-    else:
-        transformed_params = torch.empty(0, 4, device=device)
-    
-    # Combine and shuffle
-    all_params = torch.cat([aligned_params, transformed_params], dim=0)
-    perm = torch.randperm(batch_size, device=device)
-    return all_params[perm]
-
-
-def create_validation_image_grid(inputs, transformed_inputs, pred_transforms, true_transforms, max_samples=16):
+def create_validation_image_grid(targets, inputs, pred_transforms, true_transforms, max_samples=16):
     """Create a grid of validation images for wandb logging.
     
     Enhanced to show:
-    1. Original input before any transformation 
-    2. Transformed input (what the model sees)
-    3. Applied transform visualization showing the transformation effect
+    1. Ground truth target from dataset
+    2. Input image (what the model sees)
+    3. Target upscaled for comparison
     4. Predicted vs actual transform parameters comparison
     
     Args:
-        inputs: Original input images (B, C, H, W)
-        transformed_inputs: Transformed input images (B, C, H, W)
+        targets: Ground truth target images (B, C, H, W)
+        inputs: Input images (B, C, H, W)
         pred_transforms: Predicted transform parameters (B, 4)
         true_transforms: Ground truth transform parameters (B, 4)
         max_samples: Maximum number of samples to include
@@ -200,42 +140,46 @@ def create_validation_image_grid(inputs, transformed_inputs, pred_transforms, tr
     import matplotlib.pyplot as plt
     import numpy as np
     
-    batch_size = min(inputs.size(0), max_samples)
+    batch_size = min(targets.size(0), max_samples)
     
-    # Create a grid showing: original input | transformed input | applied transform visualization | transform params
+    # Create a grid showing: ground truth target | input image | target upscaled | transform params
     fig, axes = plt.subplots(batch_size, 4, figsize=(20, 5 * batch_size))
     if batch_size == 1:
         axes = axes.reshape(1, -1)
     
     for i in range(batch_size):
         # Images
-        original_img = inputs[i].cpu().permute(1, 2, 0).numpy()
-        transformed_img = transformed_inputs[i].cpu().permute(1, 2, 0).numpy()
+        target_img = targets[i].cpu().permute(1, 2, 0).numpy()
+        input_img = inputs[i].cpu().permute(1, 2, 0).numpy()
         
         # Clip values to [0, 1] for display
-        original_img = np.clip(original_img, 0, 1)
-        transformed_img = np.clip(transformed_img, 0, 1)
+        target_img = np.clip(target_img, 0, 1)
+        input_img = np.clip(input_img, 0, 1)
         
         # Extract transform parameters
         true_t = true_transforms[i].cpu().numpy()
         pred_t = pred_transforms[i].cpu().numpy()
         
-        # Original input
-        axes[i, 0].imshow(original_img)
-        axes[i, 0].set_title(f"Original Input\nSample {i}")
+        # Ground truth target
+        axes[i, 0].imshow(target_img)
+        axes[i, 0].set_title(f"Ground Truth Target\nSample {i}")
         axes[i, 0].axis('off')
         
-        # Transformed input (what the model sees)
-        axes[i, 1].imshow(transformed_img)
+        # Input image (what the model sees)
+        axes[i, 1].imshow(input_img)
         transform_text = f"True: [{true_t[0]:.2f}, {true_t[1]:.2f}, {true_t[2]:.2f}, {true_t[3]:.2f}]"
-        axes[i, 1].set_title(f"Transformed Input\n{transform_text}")
+        axes[i, 1].set_title(f"Input Image\n{transform_text}")
         axes[i, 1].axis('off')
         
-        # Applied transform visualization - difference map
-        diff = np.abs(transformed_img - original_img)
-        diff_norm = diff / (diff.max() + 1e-8)  # Normalize for better visibility
-        axes[i, 2].imshow(diff_norm)
-        axes[i, 2].set_title(f"Transform Effect\n(Difference Map)")
+        # Target upscaled for better visibility
+        from scipy.ndimage import zoom
+        if target_img.shape[0] < input_img.shape[0]:  # If target is smaller, upscale it
+            scale_factor = input_img.shape[0] // target_img.shape[0]
+            upscaled_target = zoom(target_img, (scale_factor, scale_factor, 1), order=0)
+        else:
+            upscaled_target = target_img
+        axes[i, 2].imshow(upscaled_target)
+        axes[i, 2].set_title(f"Target (Upscaled)\nfor Comparison")
         axes[i, 2].axis('off')
         
         # Transform parameters comparison
@@ -343,14 +287,16 @@ def validate_epoch(model, dataloader, criterion, device, epoch: int,
     # For image logging
     logged_samples = 0
     sample_inputs = []
+    sample_targets = []
     sample_pred_transforms = []
     sample_true_transforms = []
     
     with torch.no_grad():
         for batch_idx, (inputs, target_data) in enumerate(tqdm(dataloader, desc=f'Val {epoch}')):
             inputs = inputs.to(device)
-            # Extract transformation parameters from target data
-            _, true_transform_params = target_data
+            # Extract target images and transformation parameters from target data
+            target_images, true_transform_params = target_data
+            target_images = target_images.to(device)
             true_transform_params = true_transform_params.to(device)
             
             pred_transform_params = model(inputs)
@@ -372,6 +318,7 @@ def validate_epoch(model, dataloader, criterion, device, epoch: int,
             if log_images and logged_samples < max_image_samples and wandb.run is not None:
                 samples_to_take = min(inputs.size(0), max_image_samples - logged_samples)
                 sample_inputs.append(inputs[:samples_to_take].cpu())
+                sample_targets.append(target_images[:samples_to_take].cpu())
                 sample_pred_transforms.append(pred_transform_params[:samples_to_take].cpu())
                 sample_true_transforms.append(true_transform_params[:samples_to_take].cpu())
                 logged_samples += samples_to_take
@@ -380,12 +327,13 @@ def validate_epoch(model, dataloader, criterion, device, epoch: int,
     if log_images and logged_samples > 0 and wandb.run is not None:
         # Concatenate all collected samples
         all_inputs = torch.cat(sample_inputs, dim=0)
+        all_targets = torch.cat(sample_targets, dim=0)
         all_pred_transforms = torch.cat(sample_pred_transforms, dim=0)
         all_true_transforms = torch.cat(sample_true_transforms, dim=0)
         
-        # Create validation image grid (using inputs as both original and transformed)
+        # Create validation image grid showing targets and inputs
         validation_image = create_validation_image_grid(
-            all_inputs, all_inputs,  # Same input for both original and transformed views
+            all_targets, all_inputs,
             all_pred_transforms, all_true_transforms,
             max_samples=logged_samples
         )

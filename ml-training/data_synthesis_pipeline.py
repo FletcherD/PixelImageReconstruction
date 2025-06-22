@@ -28,26 +28,25 @@ class PixelArtDataSynthesizer:
     """Synthesizes training data for pixel art recovery."""
     
     def __init__(self, 
-                 crop_size: int = 33,
-                 input_size: int = 128,
-                 target_size: int = 1,
+                 target_size: int,
+                 input_size: int,
                  complexity_threshold: float = 10.0,
                  max_retries: int = 10,
                  transform_fraction: float = 0.0,
                  seed: Optional[int] = None):
         """
         Args:
-            crop_size: Size of the square crop from source images
+            target_size: Size of the target ground truth image (e.g., 32 for 32x32 target)
             input_size: Size of the final input image
-            target_size: Size of the target patch (1 for center pixel, 32 for center patch)
             complexity_threshold: Minimum standard deviation for image complexity
             max_retries: Maximum attempts to find a complex enough crop
             transform_fraction: Fraction of samples to apply spatial transformations to (0.0-1.0)
             seed: Random seed for reproducibility
-        """
-        self.crop_size = crop_size
-        self.input_size = input_size
+        """        
+        # Internal crop size is 2x the target size to avoid black borders
+        self.internal_crop_size = target_size * 2
         self.target_size = target_size
+        self.input_size = input_size
         self.complexity_threshold = complexity_threshold
         self.max_retries = max_retries
         self.transform_fraction = transform_fraction
@@ -58,21 +57,14 @@ class PixelArtDataSynthesizer:
             torch.manual_seed(seed)
     
     def random_crop(self, image: Image.Image) -> Image.Image:
-        """Randomly crop a section from the input image."""
+        """Randomly crop a section from the input image (internal crop is 2x target size)."""
         width, height = image.size
         
-        if width < self.crop_size or height < self.crop_size:
-            # If image is too small, resize it first
-            scale_factor = max(self.crop_size / width, self.crop_size / height)
-            new_size = (int(width * scale_factor), int(height * scale_factor))
-            image = image.resize(new_size, Image.LANCZOS)
-            width, height = image.size
-        
         # Random crop coordinates
-        left = random.randint(0, width - self.crop_size)
-        top = random.randint(0, height - self.crop_size)
+        left = random.randint(0, width - self.internal_crop_size)
+        top = random.randint(0, height - self.internal_crop_size)
         
-        return image.crop((left, top, left + self.crop_size, top + self.crop_size))
+        return image.crop((left, top, left + self.internal_crop_size, top + self.internal_crop_size))
     
     def is_image_too_simple(self, image: Image.Image, threshold: Optional[float] = None) -> bool:
         """Check if image has too little variation (almost all one color)."""
@@ -123,24 +115,81 @@ class PixelArtDataSynthesizer:
         return Image.open(buffer).convert('RGB')
     
     def extract_center_region(self, image: Image.Image) -> Image.Image:
-        """Extract the center region from the cropped image."""
-        if self.target_size == 1:
-            # Extract center 1x1 pixel
-            center_x = center_y = self.crop_size // 2
-            return image.crop((center_x, center_y, center_x + 1, center_y + 1))
-        else:
-            # Extract center patch of specified size
-            center_x = center_y = self.crop_size // 2
-            half_target = self.target_size // 2
-            left = center_x - half_target
-            top = center_y - half_target
-            right = left + self.target_size
-            bottom = top + self.target_size
-            return image.crop((left, top, right, bottom))
+        """Extract the center target_size region from the internal 2x crop."""
+        # The image is internal_crop_size x internal_crop_size
+        # We want to extract target_size x target_size from the center
+        center_x = center_y = self.internal_crop_size // 2
+        half_target = self.target_size // 2
+        left = center_x - half_target
+        top = center_y - half_target
+        right = left + self.target_size
+        bottom = top + self.target_size
+        return image.crop((left, top, right, bottom))
     
-    def scale_to_final(self, image: Image.Image) -> Image.Image:
-        """Scale image to final size."""
-        return image.resize((self.input_size, self.input_size), Image.LANCZOS)
+    def scale_to_final(self, image: Image.Image, transform_params: Tuple[float, float, float, float]) -> Image.Image:
+        """Scale image to final size, incorporating transform parameters to avoid black borders.
+        
+        Args:
+            image: Input image to scale
+            transform_params: (x_scale, y_scale, x_offset, y_offset)
+        
+        Returns:
+            Final input_size x input_size image with proper content
+        """
+        x_scale, y_scale, x_offset, y_offset = transform_params
+
+        # Calculate base scale factors to get to 2x final size (e.g., 256x256 for 128x128 target)
+        target_intermediate_size = 2.0 * self.input_size  # e.g., 256 for 128x128 final
+        base_scale_x = target_intermediate_size / image.size[0]
+        base_scale_y = target_intermediate_size / image.size[1]
+
+        # Add the inverse transform scale factors to ensure we have enough content
+        # When transform will scale down (negative scale), we scale up more here
+        final_scale_x = base_scale_x * math.exp(-x_scale * 0.5)
+        final_scale_y = base_scale_y * math.exp(-y_scale * 0.5)
+
+        # Convert offset to pixels at the target intermediate size
+        offset_x_pixels = x_offset * self.input_size / 2  # Scale offset to intermediate resolution
+        offset_y_pixels = y_offset * self.input_size / 2
+
+        # Create affine transformation matrix that combines scaling and offset
+        # PIL uses a 6-tuple (a, b, c, d, e, f) representing the matrix:
+        # | a  b  c |   |x|   |ax + by + c|
+        # | d  e  f | * |y| = |dx + ey + f|
+        # | 0  0  1 |   |1|   |    1     |
+        #
+        # For scaling + translation: a=scale_x, b=0, c=offset_x, d=0, e=scale_y, f=offset_y
+        affine_matrix = (
+            1,    # a: x scaling
+            0,                # b: xy skew
+            offset_x_pixels,  # c: x translation
+            0,                # d: yx skew
+            1,    # e: y scaling
+            offset_y_pixels   # f: y translation
+        )
+
+        # Calculate output size for the intermediate transformation
+        intermediate_width = int(target_intermediate_size)
+        intermediate_height = int(target_intermediate_size)
+
+        # Apply the combined affine transformation
+        transformed_image = image.transform(
+            (intermediate_width, intermediate_height),
+            Image.AFFINE,
+            affine_matrix,
+            resample=Image.BILINEAR,
+            fillcolor=(0, 0, 127)  # Black fill for any empty areas
+        )
+
+        # Final center crop to target size (input_size x input_size)
+        left = (intermediate_width - self.input_size) // 2
+        top = (intermediate_height - self.input_size) // 2
+        right = left + self.input_size
+        bottom = top + self.input_size
+        
+        final_image = transformed_image.crop((left, top, right, bottom))
+        
+        return final_image
     
     def generate_transform_params(self) -> Tuple[float, float, float, float]:
         """
@@ -206,17 +255,18 @@ class PixelArtDataSynthesizer:
         # Step 1: Random crop with complexity checking
         for attempt in range(self.max_retries):
             cropped = self.random_crop(source_image)
+
+            # Step 2: Extract center region (this becomes our ground truth)
+            ground_truth = self.extract_center_region(cropped)
             
             # Check if the cropped region is too simple
-            if not self.is_image_too_simple(cropped):
+            if not self.is_image_too_simple(ground_truth):
                 break
         else:
             # If all attempts failed, use the last crop anyway
             # This prevents infinite loops with very simple source images
             pass
         
-        # Step 2: Extract center region (this becomes our ground truth)
-        ground_truth = self.extract_center_region(cropped)
         
         # Step 3: Scale up with random interpolation
         scaled = self.random_scale(cropped)
@@ -224,11 +274,11 @@ class PixelArtDataSynthesizer:
         # Step 4: JPEG compression
         compressed = self.apply_jpeg_compression(scaled)
         
-        # Step 5: Scale to final (this becomes our input)
-        input_image = self.scale_to_final(compressed)
-        
-        # Generate transformation parameters
+        # Generate transformation parameters first
         transform_params = self.generate_transform_params()
+        
+        # Step 5: Scale to final with transform parameters (this becomes our input)
+        input_image = self.scale_to_final(compressed, transform_params)
         
         return input_image, ground_truth, transform_params
 
@@ -239,13 +289,13 @@ class PixelArtDataset(Dataset):
     def __init__(self, 
                  source_images_dir: str,
                  num_samples: int,
+                 target_size: int,
+                 input_size: int,
+                 transform_fraction: float,
                  synthesizer: Optional[PixelArtDataSynthesizer] = None,
                  transform_input: Optional[transforms.Compose] = None,
-                 transform_target: Optional[transforms.Compose] = None,
-                 crop_size: int = 33,
-                 input_size: int = 128,
-                 target_size: int = 1,
-                 transform_fraction: float = 0.0):
+                 transform_target: Optional[transforms.Compose] = None
+                 ):
         """
         Args:
             source_images_dir: Directory containing source images
@@ -253,17 +303,15 @@ class PixelArtDataset(Dataset):
             synthesizer: Data synthesizer (creates one if None)
             transform_input: Transforms for input images
             transform_target: Transforms for target images
-            crop_size: Size of the square crop from source images
+            target_size: Size of the target ground truth image
             input_size: Size of the final input image
-            target_size: Size of the target patch (1 for center pixel, 32 for center patch)
             transform_fraction: Fraction of samples to apply spatial transformations to (0.0-1.0)
         """
         self.source_images_dir = Path(source_images_dir)
         self.num_samples = num_samples
         self.synthesizer = synthesizer or PixelArtDataSynthesizer(
-            crop_size=crop_size, 
-            input_size=input_size, 
             target_size=target_size,
+            input_size=input_size, 
             transform_fraction=transform_fraction
         )
         self.transform_input = transform_input
@@ -309,9 +357,6 @@ class PixelArtDataset(Dataset):
         else:
             target_tensor = transforms.ToTensor()(target_image)
         
-        # Apply spatial transformation to input based on parameters
-        input_tensor = self.synthesizer.apply_spatial_transform(input_tensor, transform_params)
-        
         # Create target data combining image and transformation parameters
         # For scale/offset training, we need both the image and transform params
         transform_tensor = torch.tensor(transform_params, dtype=torch.float32)
@@ -326,16 +371,15 @@ class HuggingFacePixelArtDataset(Dataset):
     def __init__(self, 
                  dataset_name: str,
                  num_samples: int,
+                 target_size: int,
+                 input_size: int,
+                 transform_fraction: float,
                  synthesizer: Optional[PixelArtDataSynthesizer] = None,
                  transform_input: Optional[transforms.Compose] = None,
                  transform_target: Optional[transforms.Compose] = None,
                  split: str = "train",
                  image_column: str = "image",
                  streaming: bool = False,
-                 crop_size: int = 33,
-                 input_size: int = 128,
-                 target_size: int = 1,
-                 transform_fraction: float = 0.0,
                  **load_dataset_kwargs):
         """
         Args:
@@ -347,18 +391,16 @@ class HuggingFacePixelArtDataset(Dataset):
             split: Dataset split to use (train, validation, test)
             image_column: Name of the column containing images
             streaming: Whether to use streaming mode for large datasets
-            crop_size: Size of the square crop from source images
+            target_size: Size of the target ground truth image
             input_size: Size of the final input image
-            target_size: Size of the target patch (1 for center pixel, 32 for center patch)
             transform_fraction: Fraction of samples to apply spatial transformations to (0.0-1.0)
             **load_dataset_kwargs: Additional arguments to pass to load_dataset
-        """
+        """        
         self.dataset_name = dataset_name
         self.num_samples = num_samples
         self.synthesizer = synthesizer or PixelArtDataSynthesizer(
-            crop_size=crop_size, 
-            input_size=input_size, 
             target_size=target_size,
+            input_size=input_size,
             transform_fraction=transform_fraction
         )
         self.transform_input = transform_input
@@ -429,9 +471,6 @@ class HuggingFacePixelArtDataset(Dataset):
         else:
             target_tensor = transforms.ToTensor()(target_image)
         
-        # Apply spatial transformation to input based on parameters
-        input_tensor = self.synthesizer.apply_spatial_transform(input_tensor, transform_params)
-        
         # Create target data combining image and transformation parameters
         # For scale/offset training, we need both the image and transform params
         transform_tensor = torch.tensor(transform_params, dtype=torch.float32)
@@ -442,14 +481,13 @@ class HuggingFacePixelArtDataset(Dataset):
 
 def create_hf_dataset(dataset_name: str,
                      num_samples: int,
+                     target_size: int,
+                     input_size: int,
                      save_examples: bool = True,
                      examples_dir: str = "dataset_examples",
                      split: str = "train",
                      image_column: str = "image",
                      streaming: bool = False,
-                     crop_size: int = 33,
-                     input_size: int = 128,
-                     target_size: int = 1,
                      transform_fraction: float = 0.0,
                      **load_dataset_kwargs) -> HuggingFacePixelArtDataset:
     """
@@ -485,16 +523,15 @@ def create_hf_dataset(dataset_name: str,
         split=split,
         image_column=image_column,
         streaming=streaming,
-        crop_size=crop_size,
-        input_size=input_size,
         target_size=target_size,
+        input_size=input_size,
         transform_fraction=transform_fraction,
         **load_dataset_kwargs
     )
     
     if save_examples:
         os.makedirs(examples_dir, exist_ok=True)
-        synthesizer = PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size, transform_fraction=transform_fraction, seed=69)  # Fixed seed for reproducible examples
+        synthesizer = PixelArtDataSynthesizer(target_size=target_size, input_size=input_size, transform_fraction=transform_fraction, seed=69)  # Fixed seed for reproducible examples
         
         print(f"Saving example pairs to {examples_dir}/")
         for i in range(min(10, num_samples)):  # Limit examples to 10
@@ -531,11 +568,10 @@ def create_hf_dataset(dataset_name: str,
 
 def create_dataset(source_images_dir: str, 
                   num_samples: int, 
-                  save_examples: bool = True,
+                  target_size: int,
+                  input_size: int,
+                  save_examples: bool = False,
                   examples_dir: str = "dataset_examples",
-                  crop_size: int = 33,
-                  input_size: int = 128,
-                  target_size: int = 1,
                   transform_fraction: float = 0.0) -> PixelArtDataset:
     """
     Create a PixelArtDataset and optionally save some examples.
@@ -563,15 +599,14 @@ def create_dataset(source_images_dir: str,
         num_samples=num_samples,
         transform_input=input_transform,
         transform_target=target_transform,
-        crop_size=crop_size,
-        input_size=input_size,
         target_size=target_size,
+        input_size=input_size,
         transform_fraction=transform_fraction
     )
     
     if save_examples:
         os.makedirs(examples_dir, exist_ok=True)
-        synthesizer = PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size, transform_fraction=transform_fraction, seed=42)  # Fixed seed for reproducible examples
+        synthesizer = PixelArtDataSynthesizer(target_size=target_size, input_size=input_size, transform_fraction=transform_fraction, seed=42)  # Fixed seed for reproducible examples
         
         print(f"Saving example pairs to {examples_dir}/")
         for i in range(min(10, num_samples)):  # Limit examples to 10
@@ -610,12 +645,10 @@ if __name__ == "__main__":
                        help="Column name containing images (for HF datasets)")
     parser.add_argument("--streaming", action="store_true",
                        help="Use streaming mode for large HF datasets")
-    parser.add_argument("--crop_size", type=int, default=33,
-                       help="Size of the square crop from source images")
-    parser.add_argument("--input_size", type=int, default=128,
+    parser.add_argument("--target_size", type=int, required=True,
+                       help="Size of the target ground truth image")
+    parser.add_argument("--input_size", type=int, required=True,
                        help="Size of the final input image")
-    parser.add_argument("--target_size", type=int, default=1,
-                       help="Size of the target patch (1 for center pixel, 32 for center patch)")
     parser.add_argument("--transform_fraction", type=float, default=0.0,
                        help="Fraction of samples to apply spatial transformations to (0.0-1.0)")
     
@@ -635,9 +668,8 @@ if __name__ == "__main__":
             split=args.split,
             image_column=args.image_column,
             streaming=args.streaming,
-            crop_size=args.crop_size,
-            input_size=args.input_size,
             target_size=args.target_size,
+            input_size=args.input_size,
             transform_fraction=args.transform_fraction
         )
     else:
@@ -647,9 +679,8 @@ if __name__ == "__main__":
             num_samples=args.num_samples,
             save_examples=True,
             examples_dir=args.examples_dir,
-            crop_size=args.crop_size,
-            input_size=args.input_size,
             target_size=args.target_size,
+            input_size=args.input_size,
             transform_fraction=args.transform_fraction
         )
     
