@@ -392,6 +392,240 @@ class ImageParameterOptimizer:
         print(f"Scale factors: ({scale_x:.4f}, {scale_y:.4f})")
         print(f"Offset values: ({offset_x:.4f}, {offset_y:.4f})")
     
+    def variance_objective_function(self, 
+                                   scale_x: float, scale_y: float, 
+                                   offset_x: float, offset_y: float,
+                                   original_image: Image.Image) -> Tuple[float, Dict]:
+        """
+        Objective function that minimizes the variance of predicted offsets across patches.
+        
+        Args:
+            scale_x: Current X scaling factor
+            scale_y: Current Y scaling factor
+            offset_x: Current X offset
+            offset_y: Current Y offset
+            original_image: Original PIL Image
+            
+        Returns:
+            Tuple of (variance_loss, prediction_dict)
+        """
+        # Apply transformation to image
+        transformed_image = rescale_image(original_image, scale_x, scale_y, offset_x, offset_y)
+        
+        # Get patch-based predictions to access individual patch results
+        result = self.inference.predict_single(transformed_image, use_patches=True)
+        
+        # Calculate variance of offset predictions across patches
+        if hasattr(self.inference, 'last_patch_results') and self.inference.last_patch_results:
+            offset_x_preds = [patch['offset_x'] for patch in self.inference.last_patch_results]
+            offset_y_preds = [patch['offset_y'] for patch in self.inference.last_patch_results]
+            
+            var_offset_x = np.var(offset_x_preds)
+            var_offset_y = np.var(offset_y_preds)
+            variance_loss = var_offset_x + var_offset_y
+        else:
+            # Fallback: use standard deviation from result if available
+            var_offset_x = result.get('offset_x_std', 0.0) ** 2
+            var_offset_y = result.get('offset_y_std', 0.0) ** 2
+            variance_loss = var_offset_x + var_offset_y
+        
+        return variance_loss, result
+
+    def optimize_variance(self, 
+                         image_path: str,
+                         initial_scale: Tuple[float, float] = (1.0, 1.0),
+                         initial_offset: Tuple[float, float] = (0.0, 0.0),
+                         verbose: bool = True) -> Dict:
+        """
+        Optimize both scale and offset to minimize variance of predicted offsets across patches.
+        
+        Args:
+            image_path: Path to the image to optimize
+            initial_scale: Initial (scale_x, scale_y) values
+            initial_offset: Initial (offset_x, offset_y) values
+            verbose: Whether to print progress
+            
+        Returns:
+            Dictionary with optimization results
+        """
+        # Load original image
+        original_image = Image.open(image_path).convert('RGB')
+        
+        # Initialize parameters
+        scale_x, scale_y = initial_scale
+        offset_x, offset_y = initial_offset
+        current_lr = self.learning_rate
+        
+        # Initialize history for variance optimization
+        self.history = {
+            'loss': [],
+            'learning_rates': [],
+            'scale_x': [],
+            'scale_y': [],
+            'offset_x': [],
+            'offset_y': [],
+            'pred_offset_x': [],
+            'pred_offset_y': [],
+            'pred_offset_x_std': [],
+            'pred_offset_y_std': [],
+            'offset_variance_x': [],
+            'offset_variance_y': []
+        }
+        
+        if verbose:
+            print(f"Starting variance-based optimization for {image_path}")
+            print(f"Initial scale: ({scale_x:.4f}, {scale_y:.4f})")
+            print(f"Initial offset: ({offset_x:.4f}, {offset_y:.4f})")
+            print(f"Target: minimize variance of offset predictions across patches")
+            print("-" * 60)
+        
+        best_loss = float('inf')
+        best_scales = (scale_x, scale_y)
+        best_offsets = (offset_x, offset_y)
+        patience = 100
+        no_improve_count = 0
+        
+        for iteration in range(self.max_iterations):
+            # Evaluate current position using variance objective
+            loss, result = self.variance_objective_function(scale_x, scale_y, offset_x, offset_y, original_image)
+            
+            # Calculate individual variances for tracking
+            if hasattr(self.inference, 'last_patch_results') and self.inference.last_patch_results:
+                offset_x_preds = [patch['offset_x'] for patch in self.inference.last_patch_results]
+                offset_y_preds = [patch['offset_y'] for patch in self.inference.last_patch_results]
+                var_offset_x = np.var(offset_x_preds)
+                var_offset_y = np.var(offset_y_preds)
+            else:
+                var_offset_x = result.get('offset_x_std', 0.0) ** 2
+                var_offset_y = result.get('offset_y_std', 0.0) ** 2
+            
+            # Record history
+            self.history['scale_x'].append(scale_x)
+            self.history['scale_y'].append(scale_y)
+            self.history['offset_x'].append(offset_x)
+            self.history['offset_y'].append(offset_y)
+            self.history['pred_offset_x'].append(result['offset_x'])
+            self.history['pred_offset_y'].append(result['offset_y'])
+            self.history['pred_offset_x_std'].append(result.get('offset_x_std', 0))
+            self.history['pred_offset_y_std'].append(result.get('offset_y_std', 0))
+            self.history['offset_variance_x'].append(var_offset_x)
+            self.history['offset_variance_y'].append(var_offset_y)
+            self.history['loss'].append(loss)
+            self.history['learning_rates'].append(current_lr)
+            
+            if verbose:
+                print(f"Iter {iteration:3d}: Scale=({scale_x:.4f}, {scale_y:.4f}) "
+                      f"Offset=({offset_x:.4f}, {offset_y:.4f}) "
+                      f"OffsetVar=({var_offset_x:.6f}, {var_offset_y:.6f}) "
+                      f"Loss={loss:.6f} LR={current_lr:.4f}")
+            
+            # Check for improvement
+            if loss < best_loss - self.tolerance:
+                best_loss = loss
+                best_scales = (scale_x, scale_y)
+                best_offsets = (offset_x, offset_y)
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+            
+            # Early stopping
+            if no_improve_count >= patience:
+                if verbose:
+                    print(f"Early stopping at iteration {iteration} (no improvement for {patience} steps)")
+                break
+            
+            # Check convergence
+            if loss < self.tolerance:
+                if verbose:
+                    print(f"Converged at iteration {iteration} (variance < {self.tolerance})")
+                break
+            
+            # Adaptive learning rate
+            if iteration > 0:
+                # Decrease learning rate if loss increased
+                if loss > self.history['loss'][-2]:
+                    current_lr *= 0.9
+                # Increase learning rate if loss decreased significantly
+                elif loss < self.history['loss'][-2] * 0.95:
+                    current_lr *= 1.05
+                
+                # Clamp learning rate
+                current_lr = np.clip(current_lr, 1e-4, 0.05)
+            
+            # Compute numerical gradient for variance objective
+            epsilon = 0.001
+            
+            # Gradient w.r.t. scale_x
+            loss_plus_sx, _ = self.variance_objective_function(scale_x + epsilon, scale_y, offset_x, offset_y, original_image)
+            loss_minus_sx, _ = self.variance_objective_function(scale_x - epsilon, scale_y, offset_x, offset_y, original_image)
+            grad_scale_x = (loss_plus_sx - loss_minus_sx) / (2 * epsilon)
+            
+            # Gradient w.r.t. scale_y
+            loss_plus_sy, _ = self.variance_objective_function(scale_x, scale_y + epsilon, offset_x, offset_y, original_image)
+            loss_minus_sy, _ = self.variance_objective_function(scale_x, scale_y - epsilon, offset_x, offset_y, original_image)
+            grad_scale_y = (loss_plus_sy - loss_minus_sy) / (2 * epsilon)
+            
+            # Gradient w.r.t. offset_x
+            loss_plus_ox, _ = self.variance_objective_function(scale_x, scale_y, offset_x + epsilon, offset_y, original_image)
+            loss_minus_ox, _ = self.variance_objective_function(scale_x, scale_y, offset_x - epsilon, offset_y, original_image)
+            grad_offset_x = (loss_plus_ox - loss_minus_ox) / (2 * epsilon)
+            
+            # Gradient w.r.t. offset_y
+            loss_plus_oy, _ = self.variance_objective_function(scale_x, scale_y, offset_x, offset_y + epsilon, original_image)
+            loss_minus_oy, _ = self.variance_objective_function(scale_x, scale_y, offset_x, offset_y - epsilon, original_image)
+            grad_offset_y = (loss_plus_oy - loss_minus_oy) / (2 * epsilon)
+            
+            # Update parameters using gradient descent
+            # Scale updates more slowly (half the learning rate)
+            scale_x -= current_lr * 0.5 * grad_scale_x
+            scale_y -= current_lr * 0.5 * grad_scale_y
+            offset_x -= current_lr * grad_offset_x
+            offset_y -= current_lr * grad_offset_y
+            
+            # Constrain parameters to reasonable ranges
+            scale_x = np.clip(scale_x, 0.5, 5.0)
+            scale_y = np.clip(scale_y, 0.5, 5.0)
+            offset_x = np.clip(offset_x, -1.0, 1.0)
+            offset_y = np.clip(offset_y, -1.0, 1.0)
+        
+        # Final evaluation at best point
+        final_loss, final_result = self.variance_objective_function(best_scales[0], best_scales[1], best_offsets[0], best_offsets[1], original_image)
+        
+        optimization_result = {
+            'success': final_loss < self.tolerance * 10,
+            'final_scales': best_scales,
+            'final_offsets': best_offsets,
+            'final_predictions': {
+                'offset': (final_result['offset_x'], final_result['offset_y'])
+            },
+            'final_loss': final_loss,
+            'iterations': len(self.history['loss']),
+            'history': self.history.copy(),
+            'initial_scale': initial_scale,
+            'initial_offset': initial_offset,
+            'optimize_scale': True,
+            'optimize_offset': True,
+            'optimization_type': 'variance',
+            'original_size': original_image.size,
+            'optimized_size': (
+                int(original_image.size[0] * best_scales[0]),
+                int(original_image.size[1] * best_scales[1])
+            )
+        }
+        
+        if verbose:
+            print("-" * 60)
+            print(f"Variance optimization complete!")
+            print(f"Final scale: ({best_scales[0]:.4f}, {best_scales[1]:.4f})")
+            print(f"Final offset: ({best_offsets[0]:.4f}, {best_offsets[1]:.4f})")
+            print(f"Final offset predictions: ({final_result['offset_x']:+.4f}, {final_result['offset_y']:+.4f})")
+            print(f"Final variance loss: {final_loss:.6f}")
+            print(f"Original size: {original_image.size}")
+            print(f"Optimized size: {optimization_result['optimized_size']}")
+            print(f"Success: {optimization_result['success']}")
+        
+        return optimization_result
+
     def visualize_optimization(self, 
                              optimization_result: Dict,
                              output_path: str):
@@ -405,9 +639,13 @@ class ImageParameterOptimizer:
         history = optimization_result['history']
         optimize_scale = optimization_result['optimize_scale']
         optimize_offset = optimization_result['optimize_offset']
+        is_variance_opt = optimization_result.get('optimization_type') == 'variance'
         
         # Determine subplot layout based on what was optimized
-        if optimize_scale and optimize_offset:
+        if is_variance_opt:
+            fig, axes = plt.subplots(3, 3, figsize=(18, 18))
+            axes = axes.flatten()
+        elif optimize_scale and optimize_offset:
             fig, axes = plt.subplots(3, 3, figsize=(18, 18))
             axes = axes.flatten()
         else:
@@ -479,6 +717,20 @@ class ImageParameterOptimizer:
             ax.grid(True, alpha=0.3)
             plot_idx += 1
         
+        # Variance-specific plots
+        if is_variance_opt and 'offset_variance_x' in history:
+            # Offset variance over time
+            ax = axes[plot_idx]
+            ax.plot(iterations, history['offset_variance_x'], 'r-', label='Offset X Variance', linewidth=2)
+            ax.plot(iterations, history['offset_variance_y'], 'g-', label='Offset Y Variance', linewidth=2)
+            ax.set_xlabel('Iteration')
+            ax.set_ylabel('Offset Variance')
+            ax.set_title('Offset Prediction Variance Evolution')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            ax.set_yscale('log')
+            plot_idx += 1
+        
         # Learning rate over time
         if plot_idx < len(axes):
             ax = axes[plot_idx]
@@ -500,10 +752,12 @@ class ImageParameterOptimizer:
         final_preds = optimization_result['final_predictions']
         
         summary_text = f"Optimization Summary:\n"
+        summary_text += f"Type: {'Variance Minimization' if is_variance_opt else 'Prediction Minimization'}\n"
         if optimize_scale:
             summary_text += f"Initial Scale: ({optimization_result['initial_scale'][0]:.3f}, {optimization_result['initial_scale'][1]:.3f})\n"
             summary_text += f"Final Scale: ({final_scales[0]:.3f}, {final_scales[1]:.3f})\n"
-            summary_text += f"Scale Predictions: ({final_preds['scale'][0]:+.3f}, {final_preds['scale'][1]:+.3f})\n"
+            if 'scale' in final_preds:
+                summary_text += f"Scale Predictions: ({final_preds['scale'][0]:+.3f}, {final_preds['scale'][1]:+.3f})\n"
         if optimize_offset:
             summary_text += f"Initial Offset: ({optimization_result['initial_offset'][0]:.3f}, {optimization_result['initial_offset'][1]:.3f})\n"
             summary_text += f"Final Offset: ({final_offsets[0]:.3f}, {final_offsets[1]:.3f})\n"
@@ -536,8 +790,8 @@ def main():
                        help="Path to save optimization visualization")
     
     # Optimization mode
-    parser.add_argument("--optimize", type=str, choices=["scale", "offset", "both"], default="scale",
-                       help="What to optimize: scale, offset, or both")
+    parser.add_argument("--optimize", type=str, choices=["scale", "offset", "both", "variance"], default="scale",
+                       help="What to optimize: scale, offset, both, or variance (minimizes variance of offset predictions)")
     
     # Optimization parameters
     parser.add_argument("--initial_scale_x", type=float, default=1.0,
@@ -577,6 +831,7 @@ def main():
     # Determine optimization mode
     optimize_scale = args.optimize in ["scale", "both"]
     optimize_offset = args.optimize in ["offset", "both"]
+    is_variance_optimization = args.optimize == "variance"
     
     try:
         # Create optimizer
@@ -589,15 +844,23 @@ def main():
         )
         
         # Run optimization
-        result = optimizer.optimize(
-            image_path=args.image,
-            initial_scale=(args.initial_scale_x, args.initial_scale_y),
-            initial_offset=(args.initial_offset_x, args.initial_offset_y),
-            optimize_scale=optimize_scale,
-            optimize_offset=optimize_offset,
-            adaptive_lr=not args.no_adaptive_lr,
-            verbose=not args.quiet
-        )
+        if is_variance_optimization:
+            result = optimizer.optimize_variance(
+                image_path=args.image,
+                initial_scale=(args.initial_scale_x, args.initial_scale_y),
+                initial_offset=(args.initial_offset_x, args.initial_offset_y),
+                verbose=not args.quiet
+            )
+        else:
+            result = optimizer.optimize(
+                image_path=args.image,
+                initial_scale=(args.initial_scale_x, args.initial_scale_y),
+                initial_offset=(args.initial_offset_x, args.initial_offset_y),
+                optimize_scale=optimize_scale,
+                optimize_offset=optimize_offset,
+                adaptive_lr=not args.no_adaptive_lr,
+                verbose=not args.quiet
+            )
         
         # Save optimized image if requested
         if args.output_image:
@@ -620,13 +883,17 @@ def main():
             print(f"Optimization mode: {args.optimize}")
             print(f"Original size: {result['original_size']}")
             print(f"Optimized size: {result['optimized_size']}")
-            if optimize_scale:
-                print(f"Scale factors: ({result['final_scales'][0]:.4f}, {result['final_scales'][1]:.4f})")
-                print(f"Final scale predictions: ({result['final_predictions']['scale'][0]:+.4f}, {result['final_predictions']['scale'][1]:+.4f})")
-            if optimize_offset:
-                print(f"Offset values: ({result['final_offsets'][0]:.4f}, {result['final_offsets'][1]:.4f})")
+            print(f"Scale factors: ({result['final_scales'][0]:.4f}, {result['final_scales'][1]:.4f})")
+            print(f"Offset values: ({result['final_offsets'][0]:.4f}, {result['final_offsets'][1]:.4f})")
+            if is_variance_optimization:
                 print(f"Final offset predictions: ({result['final_predictions']['offset'][0]:+.4f}, {result['final_predictions']['offset'][1]:+.4f})")
-            print(f"Final loss: {result['final_loss']:.6f}")
+                print(f"Final variance loss: {result['final_loss']:.6f}")  
+            else:
+                if optimize_scale and 'scale' in result['final_predictions']:
+                    print(f"Final scale predictions: ({result['final_predictions']['scale'][0]:+.4f}, {result['final_predictions']['scale'][1]:+.4f})")
+                if optimize_offset:
+                    print(f"Final offset predictions: ({result['final_predictions']['offset'][0]:+.4f}, {result['final_predictions']['offset'][1]:+.4f})")
+                print(f"Final loss: {result['final_loss']:.6f}")
             print(f"Converged: {result['success']}")
             print(f"Iterations: {result['iterations']}")
         
