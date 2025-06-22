@@ -57,15 +57,71 @@ class EffectivenessVisualizerBase(ABC):
         """
         pass
     
-    @abstractmethod
     def run_inference_on_images(self, 
                               transformed_images: List[Tuple[float, float, str]],
-                              param_name: str) -> List[Dict]:
+                              param_name: str,
+                              batch_size: int = 32) -> List[Dict]:
         """
-        Run inference on all transformed images.
-        Must be implemented by subclasses.
+        Run inference on all transformed images using batch processing.
+        
+        Args:
+            transformed_images: List of (param_x, param_y, image_path) tuples
+            param_name: Parameter name (e.g., 'scale', 'offset')
+            batch_size: Batch size for inference
+            
+        Returns:
+            List of inference results with ground truth parameters
         """
-        pass
+        print(f"Running batch inference on {len(transformed_images)} images...")
+        
+        results = []
+        
+        # Process in batches
+        for i in range(0, len(transformed_images), batch_size):
+            batch_images = transformed_images[i:i + batch_size]
+            batch_paths = [img_path for _, _, img_path in batch_images]
+            batch_params = [(param_x, param_y) for param_x, param_y, _ in batch_images]
+            
+            try:
+                # Run batch inference (no patches for efficiency)
+                batch_results = self.inference.predict_batch_direct(batch_paths)
+                
+                # Add ground truth information and calculate errors
+                for j, result in enumerate(batch_results):
+                    true_param_x, true_param_y = batch_params[j]
+                    
+                    # Add ground truth information
+                    result[f'true_{param_name}_x'] = true_param_x
+                    result[f'true_{param_name}_y'] = true_param_y
+                    result['image_path'] = batch_paths[j]
+                    
+                    # Calculate errors
+                    result[f'error_{param_name}_x'] = result[f'{param_name}_x'] - true_param_x
+                    result[f'error_{param_name}_y'] = result[f'{param_name}_y'] - true_param_y
+                    result[f'abs_error_{param_name}_x'] = abs(result[f'error_{param_name}_x'])
+                    result[f'abs_error_{param_name}_y'] = abs(result[f'error_{param_name}_y'])
+                    
+                    # Add dummy variance values for single-image inference
+                    result[f'{param_name}_x_std'] = 0.0
+                    result[f'{param_name}_y_std'] = 0.0
+                    
+                    results.append(result)
+                    
+            except Exception as e:
+                print(f"Error processing batch {i//batch_size + 1}: {e}")
+                # Add error entries for failed batch
+                for j, (true_param_x, true_param_y, img_path) in enumerate(batch_images):
+                    results.append({
+                        f'true_{param_name}_x': true_param_x,
+                        f'true_{param_name}_y': true_param_y,
+                        'image_path': img_path,
+                        'error': str(e)
+                    })
+        
+        valid_results = [r for r in results if 'error' not in r]
+        print(f"Successfully processed {len(valid_results)}/{len(results)} images")
+        
+        return results
     
     def create_comprehensive_visualization(self, 
                                         results: List[Dict],
@@ -293,7 +349,8 @@ Dataset:
                     temp_dir: Optional[str] = None,
                     cleanup: bool = True,
                     param_name: str = "param",
-                    param_display_name: str = "Parameter"):
+                    param_display_name: str = "Parameter",
+                    batch_size: int = 32):
         """
         Run the complete effectiveness analysis.
         
@@ -319,7 +376,7 @@ Dataset:
         )
         
         # Run inference
-        results = self.run_inference_on_images(transformed_images, param_name)
+        results = self.run_inference_on_images(transformed_images, param_name, batch_size)
         
         # Create visualization
         self.create_comprehensive_visualization(
@@ -383,6 +440,8 @@ def create_common_argument_parser(param_name: str, param_display_name: str, defa
     # System parameters
     parser.add_argument("--input_size", type=int, default=128,
                        help="Model input size")
+    parser.add_argument("--batch_size", type=int, default=32,
+                       help="Batch size for inference")
     parser.add_argument("--temp_dir", type=str,
                        help=f"Temporary directory for {param_name} images")
     parser.add_argument("--keep_temp", action="store_true",
@@ -435,7 +494,8 @@ def validate_and_run_analysis(args, visualizer, param_name: str, param_display_n
             temp_dir=args.temp_dir,
             cleanup=not args.keep_temp,
             param_name=param_name,
-            param_display_name=param_display_name
+            param_display_name=param_display_name,
+            batch_size=args.batch_size
         )
         
         return 0

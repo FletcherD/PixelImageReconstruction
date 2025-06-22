@@ -72,54 +72,6 @@ class OffsetEffectivenessVisualizer(EffectivenessVisualizerBase):
         return offset_images
 
     
-    def run_inference_on_images(self, 
-                              transformed_images: List[Tuple[float, float, str]],
-                              param_name: str) -> List[Dict]:
-        """
-        Run offset inference on all offset images.
-        
-        Args:
-            transformed_images: List of (offset_x, offset_y, image_path) tuples
-            param_name: Parameter name ('offset')
-            
-        Returns:
-            List of inference results with ground truth offsets
-        """
-        print("Running inference on offset images...")
-        
-        results = []
-        
-        for true_param_x, true_param_y, image_path in transformed_images:
-            try:
-                # Run inference
-                result = self.inference.predict_single(image_path)
-                
-                # Add ground truth information
-                result[f'true_{param_name}_x'] = true_param_x
-                result[f'true_{param_name}_y'] = true_param_y
-                result['image_path'] = image_path
-                
-                # Calculate errors
-                result[f'error_{param_name}_x'] = result[f'{param_name}_x'] - true_param_x
-                result[f'error_{param_name}_y'] = result[f'{param_name}_y'] - true_param_y
-                result[f'abs_error_{param_name}_x'] = abs(result[f'error_{param_name}_x'])
-                result[f'abs_error_{param_name}_y'] = abs(result[f'error_{param_name}_y'])
-                
-                results.append(result)
-                
-            except Exception as e:
-                print(f"Error processing {image_path}: {e}")
-                results.append({
-                    f'true_{param_name}_x': true_param_x,
-                    f'true_{param_name}_y': true_param_y,
-                    'image_path': image_path,
-                    'error': str(e)
-                })
-        
-        valid_results = [r for r in results if 'error' not in r]
-        print(f"Successfully processed {len(valid_results)}/{len(results)} images")
-        
-        return results
     
     
 

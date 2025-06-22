@@ -81,6 +81,72 @@ class ScaleOffsetInference:
         
         return tensor
     
+    def preprocess_images_batch(self, images: List[Union[str, Path, Image.Image]]) -> torch.Tensor:
+        """
+        Preprocess a batch of images for inference.
+        
+        Args:
+            images: List of image paths or PIL Images
+            
+        Returns:
+            Batched tensor of shape (batch_size, 3, height, width)
+        """
+        tensors = []
+        for image in images:
+            if isinstance(image, (str, Path)):
+                image = Image.open(image).convert('RGB')
+            elif not isinstance(image, Image.Image):
+                raise ValueError("Image must be a path or PIL Image")
+            
+            # Apply transforms
+            tensor = self.transform(image)
+            tensors.append(tensor)
+        
+        # Stack into batch
+        return torch.stack(tensors)
+    
+    def predict_batch_direct(self, images: List[Union[str, Path, Image.Image]]) -> List[dict]:
+        """
+        Predict scale and offset for a batch of images using direct batch inference (no patches).
+        
+        Args:
+            images: List of image paths or PIL Images
+            
+        Returns:
+            List of prediction dictionaries
+        """
+        if not images:
+            return []
+        
+        # Preprocess all images
+        batch_tensor = self.preprocess_images_batch(images).to(self.device)
+        
+        # Run batch inference
+        with torch.no_grad():
+            batch_output = self.model(batch_tensor)
+            batch_scale, batch_offset = self.model.predict_transform_params(batch_tensor)
+        
+        # Convert to individual results
+        results = []
+        for i in range(len(images)):
+            output_np = batch_output[i].cpu().numpy()
+            scale_np = batch_scale[i].cpu().numpy()
+            offset_np = batch_offset[i].cpu().numpy()
+            
+            results.append({
+                'raw_output': output_np,
+                'scale_x': float(scale_np[0]),
+                'scale_y': float(scale_np[1]),
+                'offset_x': float(offset_np[0]),
+                'offset_y': float(offset_np[1]),
+                'scale': scale_np,
+                'offset': offset_np,
+                'num_patches': 1,
+                'image': str(images[i]) if isinstance(images[i], (str, Path)) else "PIL_Image"
+            })
+        
+        return results
+    
     def extract_patches(self, image: Image.Image, patch_size: int = None, overlap: float = 0.5) -> List[torch.Tensor]:
         """
         Extract overlapping patches from an image for patch-based inference.
