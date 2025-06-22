@@ -126,8 +126,8 @@ def apply_random_transform(image, transform_params):
     
     # Create affine transformation matrix
     theta = torch.zeros(1, 2, 3, device=image.device, dtype=image.dtype)
-    theta[0, 0, 0] = torch.exp(x_scale * 0.4 - 0.2)
-    theta[0, 1, 1] = torch.exp(y_scale * 0.4 - 0.2)
+    theta[0, 0, 0] = torch.exp(x_scale * 0.2)
+    theta[0, 1, 1] = torch.exp(y_scale * 0.2)
     theta[0, 0, 2] = x_offset / 32.0
     theta[0, 1, 2] = y_offset / 32.0
     
@@ -440,13 +440,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch: int,
         else:
             img_loss = torch.tensor(0.0, device=device)
         
-        # Transform parameter loss (only on transformed samples for conditional training)
-        if training_strategy == 'conditional' and transformed_mask.any():
-            trans_loss = transform_loss(pred_transform_params[transformed_mask], true_transform_params[transformed_mask])
-        elif training_strategy != 'conditional':
-            trans_loss = transform_loss(pred_transform_params, true_transform_params)
-        else:
-            trans_loss = torch.tensor(0.0, device=device)
+        trans_loss = transform_loss(pred_transform_params, true_transform_params)
         
         # Combined loss
         if transform_only_epoch:
