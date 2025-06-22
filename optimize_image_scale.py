@@ -22,6 +22,7 @@ import torch
 sys.path.append(str(Path(__file__).parent / "ml-training"))
 from infer_scale_offset import ScaleOffsetInference
 
+from pixel_spacing_optimizer import rescale_image
 
 class ScaleOptimizer:
     """Gradient descent optimizer for finding optimal image scale."""
@@ -67,6 +68,7 @@ class ScaleOptimizer:
             'loss': [],
             'learning_rates': []
         }
+
     
     def objective_function(self, scale_x: float, scale_y: float, original_image: Image.Image) -> Tuple[float, Dict]:
         """
@@ -89,7 +91,7 @@ class ScaleOptimizer:
         new_width = max(new_width, self.input_size)
         new_height = max(new_height, self.input_size)
         
-        scaled_image = original_image.resize((new_width, new_height), Image.LANCZOS)
+        scaled_image = rescale_image(original_image, scale_x, scale_y, 0, 0)
         
         # Get predictions using patch-based inference
         result = self.inference.predict_single(scaled_image, use_patches=True)
@@ -209,28 +211,24 @@ class ScaleOptimizer:
                     print(f"Converged at iteration {iteration} (loss < {self.tolerance})")
                 break
             
-            # Sign-based heuristic: if predicted scale is negative, increase actual scale, and vice versa
-            # This takes advantage of x and y scale independence and direct sign information
-            pred_scale_x = result['scale_x']
-            pred_scale_y = result['scale_y']
+            # Compute gradients
+            grad_x, grad_y = self.compute_numerical_gradient(scale_x, scale_y, original_image)
             
             # Adaptive learning rate
             if adaptive_lr and iteration > 0:
                 # Decrease learning rate if loss increased
                 if loss > self.history['loss'][-2]:
-                    current_lr *= 0.9
+                    current_lr *= 0.8
                 # Increase learning rate if loss decreased significantly
-                elif loss < self.history['loss'][-2] * 0.95:
-                    current_lr *= 1.05
+                elif loss < self.history['loss'][-2] * 0.9:
+                    current_lr *= 1.1
                 
                 # Clamp learning rate
-                current_lr = np.clip(current_lr, 1e-4, 0.05)
+                current_lr = np.clip(current_lr, 1e-6, 0.1)
             
-            # Update parameters using sign-based heuristic
-            # If prediction is negative, we need to increase the scale (move in positive direction)
-            # If prediction is positive, we need to decrease the scale (move in negative direction)
-            scale_x -= current_lr * np.sign(pred_scale_x)
-            scale_y -= current_lr * np.sign(pred_scale_y)
+            # Update parameters
+            scale_x -= current_lr * grad_x
+            scale_y -= current_lr * grad_y
             
             # Constrain scales to reasonable range
             scale_x = np.clip(scale_x, 0.1, 5.0)

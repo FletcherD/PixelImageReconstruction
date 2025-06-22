@@ -23,6 +23,7 @@ import torch
 sys.path.append(str(Path(__file__).parent / "ml-training"))
 from infer_scale_offset import ScaleOffsetInference
 
+from pixel_spacing_optimizer import rescale_image
 
 class ScaleEffectivenessVisualizer:
     """Visualizes the effectiveness of scale detection across different input scales."""
@@ -82,11 +83,9 @@ class ScaleEffectivenessVisualizer:
         for i, scale_x in enumerate(scales):
             for j, scale_y in enumerate(scales):
                 # Calculate new dimensions
-                new_width = int(original_width * scale_x)
-                new_height = int(original_height * scale_y)
                 
                 # Resize image
-                scaled_image = original_image.resize((new_width, new_height), Image.LANCZOS)
+                scaled_image = rescale_image(original_image, scale_x, scale_y, 0, 0)
                 
                 # Save scaled image
                 scaled_path = os.path.join(temp_dir, f"scaled_{i:02d}_{j:02d}_sx{scale_x:.2f}_sy{scale_y:.2f}.png")
@@ -96,6 +95,7 @@ class ScaleEffectivenessVisualizer:
         
         print(f"Created {len(scaled_images)} scaled images")
         return scaled_images
+
     
     def run_inference_on_scaled_images(self, 
                                      scaled_images: List[Tuple[float, float, str]]) -> List[Dict]:

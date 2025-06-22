@@ -157,32 +157,81 @@ def determine_optimal_spacing(peaks):
     optimal_spacing = candidate_spacings[np.argmin(candidate_errors)]
     return optimal_spacing
 
-
-def rescale_image_to_target_spacing(image, pixel_spacing_h, pixel_spacing_v, target_spacing,
+def rescale_image_to_target_spacing(image, pixel_spacing_x, pixel_spacing_y, target_spacing,
                                      x_scale=1.0, y_scale=1.0, x_offset=0.0, y_offset=0.0):
 
-    """Rescale image to achieve target pixel spacing.
-    
-    Args:
-        image (PIL.Image): Input image to rescale
-        pixel_spacing_h (float): Current horizontal pixel spacing
-        pixel_spacing_v (float): Current vertical pixel spacing
-        target_spacing (float): Desired pixel spacing after rescaling
-        
-    Returns:
-        PIL.Image: Rescaled image
-    """
-      # Calculate base scaling factors
-    h_scale_factor = target_spacing / pixel_spacing_h
-    v_scale_factor = target_spacing / pixel_spacing_v
+    y_scale_factor = (target_spacing / pixel_spacing_y) * y_scale
+    x_scale_factor = (target_spacing / pixel_spacing_x) * x_scale
+
+    return rescale_image(image, x_scale_factor, y_scale_factor, x_offset, y_offset)
+
+def rescale_image(image, x_scale=1.0, y_scale=1.0, x_offset=0.0, y_offset=0.0):
 
     # Calculate output dimensions
-    output_width = int(image.size[0] * h_scale_factor * y_scale)
-    output_height = int(image.size[1] * v_scale_factor* x_scale)
+    output_height = int(image.size[1] * y_scale)
+    output_width = int(image.size[0] * x_scale)
+
+    # Convert PIL image to numpy array
+    img_array = np.array(image)
+
+    # Generate coordinate grid for output
+    y_coords, x_coords = np.mgrid[0:output_height, 0:output_width]
+
+    x_coords = x_coords + x_offset * 2.0
+    y_coords = y_coords + y_offset * 2.0
+
+    # Map output coordinates to input coordinates
+    input_height, input_width = img_array.shape[:2]
+
+    x_center = np.median(x_coords)
+    x_coords = x_coords / x_scale
+    y_center = np.median(y_coords)
+    y_coords = y_coords / y_scale
+
+    return _scale_to_final_pytorch(img_array, x_coords, y_coords, (output_height, output_width))
 
 
-    return image.resize((output_width, output_height))
+def _scale_to_final_pytorch(img_array, x_coords, y_coords, output_size):
+    """PyTorch implementation - GPU accelerated if available."""
+    import torch
+    import torch.nn.functional as F
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Convert to torch tensor and move to device
+    if len(img_array.shape) == 3:
+        # Convert from HWC to CHW format
+        img_tensor = torch.from_numpy(img_array.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
+    else:
+        img_tensor = torch.from_numpy(img_array).float().unsqueeze(0).unsqueeze(0).to(device)
+
+    # Normalize coordinates to [-1, 1] range for grid_sample
+    input_height, input_width = img_array.shape[:2]
+    norm_x = 2.0 * x_coords / (input_width - 1) - 1.0
+    norm_y = 2.0 * y_coords / (input_height - 1) - 1.0
+
+    # Create grid for sampling
+    grid = torch.stack([
+        torch.from_numpy(norm_x).float(),
+        torch.from_numpy(norm_y).float()
+    ], dim=-1).unsqueeze(0).to(device)
+
+    # Sample using bilinear interpolation
+    output_tensor = F.grid_sample(
+        img_tensor,
+        grid,
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=True
+    )
+
+    # Convert back to numpy and PIL
+    if len(img_array.shape) == 3:
+        output_array = output_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    else:
+        output_array = output_tensor.squeeze(0).squeeze(0).cpu().numpy()
+
+    return Image.fromarray(output_array.astype(np.uint8))
 
 
 
