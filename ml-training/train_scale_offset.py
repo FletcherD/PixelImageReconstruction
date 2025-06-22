@@ -53,12 +53,14 @@ def get_device():
         return torch.device('cpu')
 
 
+
 def create_datasets(args) -> tuple:
     """Create training and validation datasets."""
     synthesizer = PixelArtDataSynthesizer(
         crop_size=33, 
         input_size=128, 
         target_size=1,  # Not used for scale/offset detection
+        transform_fraction=args.transform_fraction,
         seed=args.seed
     )
     
@@ -75,7 +77,8 @@ def create_datasets(args) -> tuple:
             streaming=args.hf_streaming,
             crop_size=33,
             input_size=128,
-            target_size=1
+            target_size=1,
+            transform_fraction=args.transform_fraction
         )
         datasets.append(hf_dataset)
     
@@ -88,7 +91,8 @@ def create_datasets(args) -> tuple:
             synthesizer=synthesizer,
             crop_size=33,
             input_size=128,
-            target_size=1
+            target_size=1,
+            transform_fraction=args.transform_fraction
         )
         datasets.append(local_dataset)
     
@@ -268,8 +272,7 @@ def create_validation_image_grid(inputs, transformed_inputs, pred_transforms, tr
     return wandb_image
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, epoch: int, 
-                transform_fraction: float = 0.5) -> Dict[str, float]:
+def train_epoch(model, dataloader, optimizer, criterion, device, epoch: int) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
@@ -279,27 +282,14 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch: int,
     
     progress_bar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
-    for batch_idx, (inputs, _) in enumerate(progress_bar):  # Ignore targets from dataset
+    for batch_idx, (inputs, target_data) in enumerate(progress_bar):
         inputs = inputs.to(device)
-        batch_size = inputs.size(0)
-        
-        # Generate random transformation parameters
-        true_transform_params = generate_transform_params(batch_size, device, transform_fraction)
-        
-        # Apply transformations to inputs
-        transformed_inputs = []
-        for i in range(batch_size):
-            if torch.allclose(true_transform_params[i], torch.zeros(4, device=device)):
-                # No transformation
-                transformed_inputs.append(inputs[i])
-            else:
-                # Apply transformation
-                transformed_inputs.append(apply_random_transform(inputs[i], true_transform_params[i]))
-        
-        transformed_inputs = torch.stack(transformed_inputs)
+        # Extract transformation parameters from target data
+        _, true_transform_params = target_data
+        true_transform_params = true_transform_params.to(device)
         
         optimizer.zero_grad()
-        pred_transform_params = model(transformed_inputs)
+        pred_transform_params = model(inputs)
         
         # Compute loss
         loss, loss_dict = criterion(pred_transform_params, true_transform_params)
@@ -339,8 +329,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch: int,
 
 
 def validate_epoch(model, dataloader, criterion, device, epoch: int,
-                   transform_fraction: float = 0.5, log_images: bool = False, 
-                   max_image_samples: int = 16) -> Dict[str, float]:
+                   log_images: bool = False, max_image_samples: int = 16) -> Dict[str, float]:
     """Validate for one epoch."""
     model.eval()
     total_loss = 0.0
@@ -354,31 +343,17 @@ def validate_epoch(model, dataloader, criterion, device, epoch: int,
     # For image logging
     logged_samples = 0
     sample_inputs = []
-    sample_transformed_inputs = []
     sample_pred_transforms = []
     sample_true_transforms = []
     
     with torch.no_grad():
-        for batch_idx, (inputs, _) in enumerate(tqdm(dataloader, desc=f'Val {epoch}')):
+        for batch_idx, (inputs, target_data) in enumerate(tqdm(dataloader, desc=f'Val {epoch}')):
             inputs = inputs.to(device)
-            batch_size = inputs.size(0)
+            # Extract transformation parameters from target data
+            _, true_transform_params = target_data
+            true_transform_params = true_transform_params.to(device)
             
-            # Generate random transformation parameters
-            true_transform_params = generate_transform_params(batch_size, device, transform_fraction)
-            
-            # Apply transformations to inputs
-            transformed_inputs = []
-            for i in range(batch_size):
-                if torch.allclose(true_transform_params[i], torch.zeros(4, device=device)):
-                    # No transformation
-                    transformed_inputs.append(inputs[i])
-                else:
-                    # Apply transformation
-                    transformed_inputs.append(apply_random_transform(inputs[i], true_transform_params[i]))
-            
-            transformed_inputs = torch.stack(transformed_inputs)
-            
-            pred_transform_params = model(transformed_inputs)
+            pred_transform_params = model(inputs)
             
             # Compute losses
             loss, loss_dict = criterion(pred_transform_params, true_transform_params)
@@ -395,9 +370,8 @@ def validate_epoch(model, dataloader, criterion, device, epoch: int,
             
             # Collect samples for image logging
             if log_images and logged_samples < max_image_samples and wandb.run is not None:
-                samples_to_take = min(batch_size, max_image_samples - logged_samples)
+                samples_to_take = min(inputs.size(0), max_image_samples - logged_samples)
                 sample_inputs.append(inputs[:samples_to_take].cpu())
-                sample_transformed_inputs.append(transformed_inputs[:samples_to_take].cpu())
                 sample_pred_transforms.append(pred_transform_params[:samples_to_take].cpu())
                 sample_true_transforms.append(true_transform_params[:samples_to_take].cpu())
                 logged_samples += samples_to_take
@@ -406,13 +380,12 @@ def validate_epoch(model, dataloader, criterion, device, epoch: int,
     if log_images and logged_samples > 0 and wandb.run is not None:
         # Concatenate all collected samples
         all_inputs = torch.cat(sample_inputs, dim=0)
-        all_transformed_inputs = torch.cat(sample_transformed_inputs, dim=0)
         all_pred_transforms = torch.cat(sample_pred_transforms, dim=0)
         all_true_transforms = torch.cat(sample_true_transforms, dim=0)
         
-        # Create validation image grid
+        # Create validation image grid (using inputs as both original and transformed)
         validation_image = create_validation_image_grid(
-            all_inputs, all_transformed_inputs,
+            all_inputs, all_inputs,  # Same input for both original and transformed views
             all_pred_transforms, all_true_transforms,
             max_samples=logged_samples
         )
@@ -586,12 +559,10 @@ def main():
     
     for epoch in range(1, args.epochs + 1):
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, epoch,
-                                  transform_fraction=args.transform_fraction)
+        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
         
         # Validate
         val_metrics = validate_epoch(model, val_loader, criterion, device, epoch,
-                                   transform_fraction=args.transform_fraction,
                                    log_images=args.log_validation_images and not args.disable_wandb,
                                    max_image_samples=args.max_validation_images)
         

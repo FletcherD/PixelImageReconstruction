@@ -16,6 +16,7 @@ import io
 from pathlib import Path
 from typing import Tuple, List, Optional, Union
 import numpy as np
+import math
 from PIL import Image, ImageOps
 import torch
 from torch.utils.data import Dataset
@@ -32,6 +33,7 @@ class PixelArtDataSynthesizer:
                  target_size: int = 1,
                  complexity_threshold: float = 10.0,
                  max_retries: int = 10,
+                 transform_fraction: float = 0.0,
                  seed: Optional[int] = None):
         """
         Args:
@@ -40,6 +42,7 @@ class PixelArtDataSynthesizer:
             target_size: Size of the target patch (1 for center pixel, 32 for center patch)
             complexity_threshold: Minimum standard deviation for image complexity
             max_retries: Maximum attempts to find a complex enough crop
+            transform_fraction: Fraction of samples to apply spatial transformations to (0.0-1.0)
             seed: Random seed for reproducibility
         """
         self.crop_size = crop_size
@@ -47,6 +50,7 @@ class PixelArtDataSynthesizer:
         self.target_size = target_size
         self.complexity_threshold = complexity_threshold
         self.max_retries = max_retries
+        self.transform_fraction = transform_fraction
         
         if seed is not None:
             random.seed(seed)
@@ -138,12 +142,66 @@ class PixelArtDataSynthesizer:
         """Scale image to final size."""
         return image.resize((self.input_size, self.input_size), Image.LANCZOS)
     
-    def synthesize_pair(self, source_image: Image.Image) -> Tuple[Image.Image, Image.Image]:
+    def generate_transform_params(self) -> Tuple[float, float, float, float]:
         """
-        Create a (input, ground_truth) pair from source image.
+        Generate random transformation parameters.
         
         Returns:
-            Tuple of (degraded_input, ground_truth_patch)
+            Tuple of (x_scale, y_scale, x_offset, y_offset)
+        """
+        # Decide if this sample should be transformed
+        if random.random() > self.transform_fraction:
+            # No transformation (aligned sample)
+            return 0.0, 0.0, 0.0, 0.0
+        
+        # Random shift in circular pattern (-1 to 1)
+        angle = random.random() * 2 * math.pi
+        distance = random.random()
+        x_offset = distance * math.cos(angle)
+        y_offset = distance * math.sin(angle)
+        
+        # Random scale (-1 to 1)
+        x_scale = random.random() * 2 - 1
+        y_scale = random.random() * 2 - 1
+        
+        return x_scale, y_scale, x_offset, y_offset
+    
+    def apply_spatial_transform(self, image: torch.Tensor, transform_params: Tuple[float, float, float, float]) -> torch.Tensor:
+        """
+        Apply spatial transformation to input image based on parameters.
+        
+        Args:
+            image: Input image tensor (C, H, W)
+            transform_params: (x_scale, y_scale, x_offset, y_offset)
+        
+        Returns:
+            Transformed image tensor
+        """
+        x_scale, y_scale, x_offset, y_offset = transform_params
+        
+        # Skip transformation if all parameters are zero
+        if x_scale == 0.0 and y_scale == 0.0 and x_offset == 0.0 and y_offset == 0.0:
+            return image
+        
+        # Create affine transformation matrix
+        theta = torch.zeros(1, 2, 3, device=image.device, dtype=image.dtype)
+        theta[0, 0, 0] = math.exp(x_scale * 0.5)
+        theta[0, 1, 1] = math.exp(y_scale * 0.5)
+        theta[0, 0, 2] = x_offset / 64.0
+        theta[0, 1, 2] = y_offset / 64.0
+        
+        # Apply transformation
+        grid = torch.nn.functional.affine_grid(theta, image.unsqueeze(0).size(), align_corners=False)
+        transformed = torch.nn.functional.grid_sample(image.unsqueeze(0), grid, align_corners=False)
+        
+        return transformed.squeeze(0)
+    
+    def synthesize_pair(self, source_image: Image.Image) -> Tuple[Image.Image, Image.Image, Tuple[float, float, float, float]]:
+        """
+        Create a (input, ground_truth) pair from source image with optional spatial transformation.
+        
+        Returns:
+            Tuple of (degraded_input, ground_truth_patch, transform_params)
         """
         # Step 1: Random crop with complexity checking
         for attempt in range(self.max_retries):
@@ -169,7 +227,10 @@ class PixelArtDataSynthesizer:
         # Step 5: Scale to final (this becomes our input)
         input_image = self.scale_to_final(compressed)
         
-        return input_image, ground_truth
+        # Generate transformation parameters
+        transform_params = self.generate_transform_params()
+        
+        return input_image, ground_truth, transform_params
 
 
 class PixelArtDataset(Dataset):
@@ -183,7 +244,8 @@ class PixelArtDataset(Dataset):
                  transform_target: Optional[transforms.Compose] = None,
                  crop_size: int = 33,
                  input_size: int = 128,
-                 target_size: int = 1):
+                 target_size: int = 1,
+                 transform_fraction: float = 0.0):
         """
         Args:
             source_images_dir: Directory containing source images
@@ -194,10 +256,16 @@ class PixelArtDataset(Dataset):
             crop_size: Size of the square crop from source images
             input_size: Size of the final input image
             target_size: Size of the target patch (1 for center pixel, 32 for center patch)
+            transform_fraction: Fraction of samples to apply spatial transformations to (0.0-1.0)
         """
         self.source_images_dir = Path(source_images_dir)
         self.num_samples = num_samples
-        self.synthesizer = synthesizer or PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size)
+        self.synthesizer = synthesizer or PixelArtDataSynthesizer(
+            crop_size=crop_size, 
+            input_size=input_size, 
+            target_size=target_size,
+            transform_fraction=transform_fraction
+        )
         self.transform_input = transform_input
         self.transform_target = transform_target
         
@@ -227,8 +295,8 @@ class PixelArtDataset(Dataset):
             # Fallback to first image
             source_image = Image.open(self.source_image_paths[0]).convert('RGB')
         
-        # Synthesize input/target pair
-        input_image, target_image = self.synthesizer.synthesize_pair(source_image)
+        # Synthesize input/target pair with transformation parameters
+        input_image, target_image, transform_params = self.synthesizer.synthesize_pair(source_image)
         
         # Apply transforms
         if self.transform_input:
@@ -241,7 +309,15 @@ class PixelArtDataset(Dataset):
         else:
             target_tensor = transforms.ToTensor()(target_image)
         
-        return input_tensor, target_tensor
+        # Apply spatial transformation to input based on parameters
+        input_tensor = self.synthesizer.apply_spatial_transform(input_tensor, transform_params)
+        
+        # Create target data combining image and transformation parameters
+        # For scale/offset training, we need both the image and transform params
+        transform_tensor = torch.tensor(transform_params, dtype=torch.float32)
+        
+        # Return input tensor and combined target (image + transform params)
+        return input_tensor, (target_tensor, transform_tensor)
 
 
 class HuggingFacePixelArtDataset(Dataset):
@@ -259,6 +335,7 @@ class HuggingFacePixelArtDataset(Dataset):
                  crop_size: int = 33,
                  input_size: int = 128,
                  target_size: int = 1,
+                 transform_fraction: float = 0.0,
                  **load_dataset_kwargs):
         """
         Args:
@@ -273,11 +350,17 @@ class HuggingFacePixelArtDataset(Dataset):
             crop_size: Size of the square crop from source images
             input_size: Size of the final input image
             target_size: Size of the target patch (1 for center pixel, 32 for center patch)
+            transform_fraction: Fraction of samples to apply spatial transformations to (0.0-1.0)
             **load_dataset_kwargs: Additional arguments to pass to load_dataset
         """
         self.dataset_name = dataset_name
         self.num_samples = num_samples
-        self.synthesizer = synthesizer or PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size)
+        self.synthesizer = synthesizer or PixelArtDataSynthesizer(
+            crop_size=crop_size, 
+            input_size=input_size, 
+            target_size=target_size,
+            transform_fraction=transform_fraction
+        )
         self.transform_input = transform_input
         self.transform_target = transform_target
         self.image_column = image_column
@@ -332,8 +415,8 @@ class HuggingFacePixelArtDataset(Dataset):
         else:
             source_image = source_image.convert('RGB')
         
-        # Synthesize input/target pair
-        input_image, target_image = self.synthesizer.synthesize_pair(source_image)
+        # Synthesize input/target pair with transformation parameters
+        input_image, target_image, transform_params = self.synthesizer.synthesize_pair(source_image)
         
         # Apply transforms
         if self.transform_input:
@@ -346,7 +429,15 @@ class HuggingFacePixelArtDataset(Dataset):
         else:
             target_tensor = transforms.ToTensor()(target_image)
         
-        return input_tensor, target_tensor
+        # Apply spatial transformation to input based on parameters
+        input_tensor = self.synthesizer.apply_spatial_transform(input_tensor, transform_params)
+        
+        # Create target data combining image and transformation parameters
+        # For scale/offset training, we need both the image and transform params
+        transform_tensor = torch.tensor(transform_params, dtype=torch.float32)
+        
+        # Return input tensor and combined target (image + transform params)
+        return input_tensor, (target_tensor, transform_tensor)
 
 
 def create_hf_dataset(dataset_name: str,
@@ -359,6 +450,7 @@ def create_hf_dataset(dataset_name: str,
                      crop_size: int = 33,
                      input_size: int = 128,
                      target_size: int = 1,
+                     transform_fraction: float = 0.0,
                      **load_dataset_kwargs) -> HuggingFacePixelArtDataset:
     """
     Create a HuggingFacePixelArtDataset and optionally save some examples.
@@ -396,15 +488,16 @@ def create_hf_dataset(dataset_name: str,
         crop_size=crop_size,
         input_size=input_size,
         target_size=target_size,
+        transform_fraction=transform_fraction,
         **load_dataset_kwargs
     )
     
     if save_examples:
         os.makedirs(examples_dir, exist_ok=True)
-        synthesizer = PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size, seed=69)  # Fixed seed for reproducible examples
+        synthesizer = PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size, transform_fraction=transform_fraction, seed=69)  # Fixed seed for reproducible examples
         
         print(f"Saving example pairs to {examples_dir}/")
-        for i in range(num_samples):
+        for i in range(min(10, num_samples)):  # Limit examples to 10
             # Get a sample from the dataset
             sample_idx = random.randint(0, len(dataset.hf_dataset) - 1) if not streaming else i
             if streaming:
@@ -422,11 +515,15 @@ def create_hf_dataset(dataset_name: str,
             else:
                 source_image = source_image.convert('RGB')
             
-            input_img, target_img = synthesizer.synthesize_pair(source_image)
+            input_img, target_img, transform_params = synthesizer.synthesize_pair(source_image)
             
             # Save the pair
             input_img.save(f"{examples_dir}/hf_example_{i:02d}_input.png")
             target_img.save(f"{examples_dir}/hf_example_{i:02d}_target.png")
+            
+            # Save transformation info
+            with open(f"{examples_dir}/hf_example_{i:02d}_transform.txt", "w") as f:
+                f.write(f"Transform params: {transform_params}\n")
             
     
     return dataset
@@ -438,7 +535,8 @@ def create_dataset(source_images_dir: str,
                   examples_dir: str = "dataset_examples",
                   crop_size: int = 33,
                   input_size: int = 128,
-                  target_size: int = 1) -> PixelArtDataset:
+                  target_size: int = 1,
+                  transform_fraction: float = 0.0) -> PixelArtDataset:
     """
     Create a PixelArtDataset and optionally save some examples.
     
@@ -467,23 +565,28 @@ def create_dataset(source_images_dir: str,
         transform_target=target_transform,
         crop_size=crop_size,
         input_size=input_size,
-        target_size=target_size
+        target_size=target_size,
+        transform_fraction=transform_fraction
     )
     
     if save_examples:
         os.makedirs(examples_dir, exist_ok=True)
-        synthesizer = PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size, seed=42)  # Fixed seed for reproducible examples
+        synthesizer = PixelArtDataSynthesizer(crop_size=crop_size, input_size=input_size, target_size=target_size, transform_fraction=transform_fraction, seed=42)  # Fixed seed for reproducible examples
         
         print(f"Saving example pairs to {examples_dir}/")
-        for i in range(num_samples):  # Save examples
+        for i in range(min(10, num_samples)):  # Limit examples to 10
             source_path = random.choice(dataset.source_image_paths)
             source_image = Image.open(source_path).convert('RGB')
             
-            input_img, target_img = synthesizer.synthesize_pair(source_image)
+            input_img, target_img, transform_params = synthesizer.synthesize_pair(source_image)
             
             # Save the pair
             input_img.save(f"{examples_dir}/example_{i:02d}_input.png")
             target_img.save(f"{examples_dir}/example_{i:02d}_target.png")
+            
+            # Save transformation info
+            with open(f"{examples_dir}/example_{i:02d}_transform.txt", "w") as f:
+                f.write(f"Transform params: {transform_params}\n")
     
     return dataset
 
@@ -513,6 +616,8 @@ if __name__ == "__main__":
                        help="Size of the final input image")
     parser.add_argument("--target_size", type=int, default=1,
                        help="Size of the target patch (1 for center pixel, 32 for center patch)")
+    parser.add_argument("--transform_fraction", type=float, default=0.0,
+                       help="Fraction of samples to apply spatial transformations to (0.0-1.0)")
     
     args = parser.parse_args()
     
@@ -532,7 +637,8 @@ if __name__ == "__main__":
             streaming=args.streaming,
             crop_size=args.crop_size,
             input_size=args.input_size,
-            target_size=args.target_size
+            target_size=args.target_size,
+            transform_fraction=args.transform_fraction
         )
     else:
         print(f"Creating dataset with {args.num_samples} samples from {args.source_dir}")
@@ -543,12 +649,16 @@ if __name__ == "__main__":
             examples_dir=args.examples_dir,
             crop_size=args.crop_size,
             input_size=args.input_size,
-            target_size=args.target_size
+            target_size=args.target_size,
+            transform_fraction=args.transform_fraction
         )
     
     print(f"Dataset created successfully with {len(dataset)} samples")
     
     # Test loading a sample
-    input_tensor, target_tensor = dataset[0]
+    input_tensor, target_data = dataset[0]
+    target_tensor, transform_tensor = target_data
     print(f"Input shape: {input_tensor.shape}")   # Should be [3, input_size, input_size]
     print(f"Target shape: {target_tensor.shape}") # Should be [3, target_size, target_size]
+    print(f"Transform shape: {transform_tensor.shape}") # Should be [4]
+    print(f"Transform values: {transform_tensor}")  # Should show the transform parameters
