@@ -206,10 +206,11 @@ class ScaleEffectivenessVisualizer:
         
         # Predicted Scale X heatmap
         ax2 = plt.subplot(3, 4, 2)
+        pred_x_max = max(abs(np.nanmin(pred_x_grid)), abs(np.nanmax(pred_x_grid)))
         im2 = ax2.imshow(pred_x_grid, aspect='auto', origin='lower', 
                         extent=[unique_scales_x.min(), unique_scales_x.max(),
                                unique_scales_y.min(), unique_scales_y.max()],
-                        cmap='viridis')
+                        cmap='RdBu_r', vmin=-pred_x_max, vmax=pred_x_max)
         ax2.set_title('Predicted Scale X', fontsize=12)
         ax2.set_xlabel('True Scale X')
         ax2.set_ylabel('True Scale Y')
@@ -217,10 +218,11 @@ class ScaleEffectivenessVisualizer:
         
         # Predicted Scale Y heatmap
         ax3 = plt.subplot(3, 4, 3)
+        pred_y_max = max(abs(np.nanmin(pred_y_grid)), abs(np.nanmax(pred_y_grid)))
         im3 = ax3.imshow(pred_y_grid, aspect='auto', origin='lower',
                         extent=[unique_scales_x.min(), unique_scales_x.max(),
                                unique_scales_y.min(), unique_scales_y.max()],
-                        cmap='viridis')
+                        cmap='RdBu_r', vmin=-pred_y_max, vmax=pred_y_max)
         ax3.set_title('Predicted Scale Y', fontsize=12)
         ax3.set_xlabel('True Scale X')
         ax3.set_ylabel('True Scale Y')
