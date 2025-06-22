@@ -210,25 +210,28 @@ class ScaleOptimizer:
                 if verbose:
                     print(f"Converged at iteration {iteration} (loss < {self.tolerance})")
                 break
-            
-            # Compute gradients
-            grad_x, grad_y = self.compute_numerical_gradient(scale_x, scale_y, original_image)
+            # Sign-based heuristic: if predicted scale is negative, increase actual scale, and vice versa
+            # This takes advantage of x and y scale independence and direct sign information
+            pred_scale_x = result['scale_x']
+            pred_scale_y = result['scale_y']
+
             
             # Adaptive learning rate
             if adaptive_lr and iteration > 0:
                 # Decrease learning rate if loss increased
                 if loss > self.history['loss'][-2]:
-                    current_lr *= 0.8
+                    current_lr *= 0.9
                 # Increase learning rate if loss decreased significantly
-                elif loss < self.history['loss'][-2] * 0.9:
-                    current_lr *= 1.1
+                elif loss < self.history['loss'][-2] * 0.95:
+                    current_lr *= 1.05
                 
                 # Clamp learning rate
-                current_lr = np.clip(current_lr, 1e-6, 0.1)
+                current_lr = np.clip(current_lr, 1e-4, 0.05)
             
             # Update parameters
-            scale_x -= current_lr * grad_x
-            scale_y -= current_lr * grad_y
+            scale_x -= current_lr * np.sign(pred_scale_x)
+            scale_y -= current_lr * np.sign(pred_scale_y)
+
             
             # Constrain scales to reasonable range
             scale_x = np.clip(scale_x, 0.1, 5.0)

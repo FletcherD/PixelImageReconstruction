@@ -163,6 +163,8 @@ def rescale_image_to_target_spacing(image, pixel_spacing_x, pixel_spacing_y, tar
     y_scale_factor = (target_spacing / pixel_spacing_y) * y_scale
     x_scale_factor = (target_spacing / pixel_spacing_x) * x_scale
 
+    print(f"Scale factor: {x_scale_factor} {y_scale_factor}")
+
     return rescale_image(image, x_scale_factor, y_scale_factor, x_offset, y_offset)
 
 def rescale_image(image, x_scale=1.0, y_scale=1.0, x_offset=0.0, y_offset=0.0):
