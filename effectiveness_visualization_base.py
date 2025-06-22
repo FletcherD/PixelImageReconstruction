@@ -15,12 +15,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 import torch
+import torchvision.transforms as transforms
 
 # Add ml-training to path to import the inference module
 sys.path.append(str(Path(__file__).parent / "ml-training"))
 from infer_scale_offset import ScaleOffsetInference
 
-from pixel_spacing_optimizer import rescale_image
+from pixel_spacing_optimizer import rescale_image, rescale_images_torch_batch
 
 
 class EffectivenessVisualizerBase(ABC):
@@ -56,6 +57,83 @@ class EffectivenessVisualizerBase(ABC):
         Must be implemented by subclasses.
         """
         pass
+    
+    def create_transformed_images_torch_batch(self, 
+                                            original_image_path: str,
+                                            param_range: Tuple[float, float],
+                                            num_steps: int,
+                                            param_name: str) -> Tuple[List[torch.Tensor], List[Tuple[float, float]]]:
+        """
+        Create transformed versions of the input image using torch batch processing.
+        Keeps all data on GPU and avoids file I/O.
+        
+        Args:
+            original_image_path: Path to the original image
+            param_range: (min_param, max_param) for both axes
+            num_steps: Number of parameter steps in each direction
+            param_name: Parameter name ('scale' or 'offset') to determine transformation
+            
+        Returns:
+            Tuple of (List of transformed image tensors, List of (param_x, param_y) tuples)
+        """
+        device = self.inference.device
+        
+        # Load original image and convert to tensor
+        original_image = Image.open(original_image_path).convert('RGB')
+        
+        # Convert to tensor with shape (C, H, W)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        original_tensor = transform(original_image).to(device)
+        
+        # Generate parameter grid
+        params = np.linspace(param_range[0], param_range[1], num_steps)
+        
+        # Create batch of parameters
+        param_pairs = []
+        x_scales = []
+        y_scales = []
+        x_offsets = []
+        y_offsets = []
+        
+        for param_x in params:
+            for param_y in params:
+                param_pairs.append((param_x, param_y))
+                
+                if param_name == 'scale':
+                    x_scales.append(param_x)
+                    y_scales.append(param_y)
+                    x_offsets.append(0.0)
+                    y_offsets.append(0.0)
+                elif param_name == 'offset':
+                    x_scales.append(1.0)
+                    y_scales.append(1.0)
+                    x_offsets.append(param_x)
+                    y_offsets.append(param_y)
+                else:
+                    raise ValueError(f"Unknown param_name: {param_name}")
+        
+        # Convert to tensors
+        x_scales_tensor = torch.tensor(x_scales, device=device)
+        y_scales_tensor = torch.tensor(y_scales, device=device)
+        x_offsets_tensor = torch.tensor(x_offsets, device=device)
+        y_offsets_tensor = torch.tensor(y_offsets, device=device)
+        
+        # Create batch of identical source images
+        batch_size = len(param_pairs)
+        images_batch = original_tensor.unsqueeze(0).repeat(batch_size, 1, 1, 1)  # (B, C, H, W)
+        
+        print(f"Creating {batch_size} transformed images using GPU batch processing...")
+        
+        # Apply batch rescaling
+        transformed_tensors = rescale_images_torch_batch(
+            images_batch, x_scales_tensor, y_scales_tensor, 
+            x_offsets_tensor, y_offsets_tensor, device
+        )
+        
+        print(f"Created {len(transformed_tensors)} transformed image tensors on GPU")
+        return transformed_tensors, param_pairs
     
     def run_inference_on_images(self, 
                               transformed_images: List[Tuple[float, float, str]],
@@ -114,6 +192,79 @@ class EffectivenessVisualizerBase(ABC):
                         f'true_{param_name}_x': true_param_x,
                         f'true_{param_name}_y': true_param_y,
                         'image_path': img_path,
+                        'error': str(e)
+                    })
+        
+        valid_results = [r for r in results if 'error' not in r]
+        print(f"Successfully processed {len(valid_results)}/{len(results)} images")
+        
+        return results
+    
+    def run_inference_on_tensors_batch(self, 
+                                     transformed_tensors: List[torch.Tensor],
+                                     param_pairs: List[Tuple[float, float]],
+                                     param_name: str,
+                                     batch_size: int = 32) -> List[Dict]:
+        """
+        Run inference on transformed image tensors using batch processing.
+        Avoids any file I/O and keeps data on GPU.
+        
+        Args:
+            transformed_tensors: List of transformed image tensors
+            param_pairs: List of (param_x, param_y) ground truth values
+            param_name: Parameter name (e.g., 'scale', 'offset')
+            batch_size: Batch size for inference
+            
+        Returns:
+            List of inference results with ground truth parameters
+        """
+        print(f"Running batch tensor inference on {len(transformed_tensors)} images...")
+        
+        results = []
+        device = self.inference.device
+        
+        # Process in batches
+        for i in range(0, len(transformed_tensors), batch_size):
+            batch_tensors = transformed_tensors[i:i + batch_size]
+            batch_params = param_pairs[i:i + batch_size]
+            
+            try:
+                # Use patch-based inference for each tensor in the batch (matching original behavior)
+                batch_results = []
+                for tensor in batch_tensors:
+                    # Convert tensor back to PIL Image for patch-based inference
+                    # tensor shape: (C, H, W)
+                    pil_image = transforms.ToPILImage()(tensor.cpu())
+                    
+                    # Use the same patch-based inference as the original approach
+                    result = self.inference.predict_single(pil_image, use_patches=True)
+                    batch_results.append(result)
+                
+                # Process results (similar to original batch processing)
+                for j, result in enumerate(batch_results):
+                    true_param_x, true_param_y = batch_params[j]
+                    
+                    # Add ground truth information and calculate errors
+                    result[f'true_{param_name}_x'] = true_param_x
+                    result[f'true_{param_name}_y'] = true_param_y
+                    result['image'] = f"tensor_{i + j}"
+                    
+                    # Calculate errors
+                    result[f'error_{param_name}_x'] = result[f'{param_name}_x'] - true_param_x
+                    result[f'error_{param_name}_y'] = result[f'{param_name}_y'] - true_param_y
+                    result[f'abs_error_{param_name}_x'] = abs(result[f'error_{param_name}_x'])
+                    result[f'abs_error_{param_name}_y'] = abs(result[f'error_{param_name}_y'])
+                    
+                    results.append(result)
+                    
+            except Exception as e:
+                print(f"Error processing batch {i//batch_size + 1}: {e}")
+                # Add error entries for failed batch
+                for j, (true_param_x, true_param_y) in enumerate(batch_params):
+                    results.append({
+                        f'true_{param_name}_x': true_param_x,
+                        f'true_{param_name}_y': true_param_y,
+                        'image': f"tensor_{i + j}",
                         'error': str(e)
                     })
         
@@ -349,7 +500,8 @@ Dataset:
                     cleanup: bool = True,
                     param_name: str = "param",
                     param_display_name: str = "Parameter",
-                    batch_size: int = 32):
+                    batch_size: int = 32,
+                    use_torch_batch: bool = True):
         """
         Run the complete effectiveness analysis.
         
@@ -362,20 +514,37 @@ Dataset:
             cleanup: Whether to clean up temporary files
             param_name: Parameter name for internal use
             param_display_name: Parameter display name for visualization
+            use_torch_batch: Whether to use torch-native batch processing (faster, GPU-based)
         """
         print(f"Starting {param_name} effectiveness analysis for {image_path}")
         print(f"{param_display_name} range: {param_range}, Steps: {num_steps}")
         
-        # Create transformed images
-        transformed_images = self.create_transformed_images(
-            original_image_path=image_path,
-            param_range=param_range,
-            num_steps=num_steps,
-            temp_dir=temp_dir
-        )
-        
-        # Run inference
-        results = self.run_inference_on_images(transformed_images, param_name, batch_size)
+        if use_torch_batch:
+            print("Using torch-native batch processing (GPU-accelerated)")
+            # Create transformed images using torch batch processing
+            transformed_tensors, param_pairs = self.create_transformed_images_torch_batch(
+                original_image_path=image_path,
+                param_range=param_range,
+                num_steps=num_steps,
+                param_name=param_name
+            )
+            
+            # Run inference on tensors
+            results = self.run_inference_on_tensors_batch(
+                transformed_tensors, param_pairs, param_name, batch_size
+            )
+        else:
+            print("Using file-based processing (original method)")
+            # Create transformed images (file-based)
+            transformed_images = self.create_transformed_images(
+                original_image_path=image_path,
+                param_range=param_range,
+                num_steps=num_steps,
+                temp_dir=temp_dir
+            )
+            
+            # Run inference
+            results = self.run_inference_on_images(transformed_images, param_name, batch_size)
         
         # Create visualization
         self.create_comprehensive_visualization(
@@ -445,6 +614,8 @@ def create_common_argument_parser(param_name: str, param_display_name: str, defa
                        help=f"Temporary directory for {param_name} images")
     parser.add_argument("--keep_temp", action="store_true",
                        help="Keep temporary files after processing")
+    parser.add_argument("--use_files", action="store_true",
+                       help="Use file-based processing instead of torch-native batch processing")
     
     return parser
 
@@ -494,7 +665,8 @@ def validate_and_run_analysis(args, visualizer, param_name: str, param_display_n
             cleanup=not args.keep_temp,
             param_name=param_name,
             param_display_name=param_display_name,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            use_torch_batch=not args.use_files
         )
         
         return 0
