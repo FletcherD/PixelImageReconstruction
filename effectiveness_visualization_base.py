@@ -83,8 +83,11 @@ class EffectivenessVisualizerBase(ABC):
             batch_params = [(param_x, param_y) for param_x, param_y, _ in batch_images]
             
             try:
-                # Run batch inference (no patches for efficiency)
-                batch_results = self.inference.predict_batch_direct(batch_paths)
+                # Run individual inference with patches (for accuracy matching original behavior)
+                batch_results = []
+                for img_path in batch_paths:
+                    result = self.inference.predict_single(img_path, use_patches=True)
+                    batch_results.append(result)
                 
                 # Add ground truth information and calculate errors
                 for j, result in enumerate(batch_results):
@@ -100,10 +103,6 @@ class EffectivenessVisualizerBase(ABC):
                     result[f'error_{param_name}_y'] = result[f'{param_name}_y'] - true_param_y
                     result[f'abs_error_{param_name}_x'] = abs(result[f'error_{param_name}_x'])
                     result[f'abs_error_{param_name}_y'] = abs(result[f'error_{param_name}_y'])
-                    
-                    # Add dummy variance values for single-image inference
-                    result[f'{param_name}_x_std'] = 0.0
-                    result[f'{param_name}_y_std'] = 0.0
                     
                     results.append(result)
                     

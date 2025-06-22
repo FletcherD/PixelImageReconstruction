@@ -125,6 +125,8 @@ class ScaleOffsetInference:
         with torch.no_grad():
             batch_output = self.model(batch_tensor)
             batch_scale, batch_offset = self.model.predict_transform_params(batch_tensor)
+            
+            batch_scale *= -1.0
         
         # Convert to individual results
         results = []
