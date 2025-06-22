@@ -6,7 +6,7 @@ from scipy.signal import find_peaks
 from scipy.optimize import minimize
 
 
-def load_and_convert_image(image_path, offset_x=0, offset_y=0, scale_x=1.0, scale_y=1.0):
+def load_and_convert_image(image_path):
     """Load an image and convert to greyscale numpy array with optional transforms.
     
     Args:
@@ -20,20 +20,6 @@ def load_and_convert_image(image_path, offset_x=0, offset_y=0, scale_x=1.0, scal
         tuple: (PIL Image, numpy array) - Original color image and greyscale array
     """
     img = Image.open(image_path)
-    
-    # Apply scaling if specified
-    if scale_x != 1.0 or scale_y != 1.0:
-        new_width = int(img.size[0] * scale_x)
-        new_height = int(img.size[1] * scale_y)
-        img = img.resize((new_width, new_height))
-    
-    # Apply offset if specified
-    if offset_x != 0 or offset_y != 0:
-        # Create a new image with the same size as original
-        new_img = Image.new(img.mode, img.size, (0, 0, 0))
-        # Paste the original image at the offset position
-        new_img.paste(img, (offset_x, offset_y))
-        img = new_img
     
     img_grey = img.convert('L')
     img_array = np.array(img_grey, dtype=np.float32)
@@ -172,7 +158,9 @@ def determine_optimal_spacing(peaks):
     return optimal_spacing
 
 
-def rescale_image_to_target_spacing(image, pixel_spacing_h, pixel_spacing_v, target_spacing):
+def rescale_image_to_target_spacing(image, pixel_spacing_h, pixel_spacing_v, target_spacing,
+                                     x_scale=1.0, y_scale=1.0, x_offset=0.0, y_offset=0.0):
+
     """Rescale image to achieve target pixel spacing.
     
     Args:
@@ -184,9 +172,16 @@ def rescale_image_to_target_spacing(image, pixel_spacing_h, pixel_spacing_v, tar
     Returns:
         PIL.Image: Rescaled image
     """
-    h_scale = target_spacing / pixel_spacing_h
-    v_scale = target_spacing / pixel_spacing_v
-    return image.resize((int(image.size[0] * h_scale), int(image.size[1] * v_scale)))
+      # Calculate base scaling factors
+    h_scale_factor = target_spacing / pixel_spacing_h
+    v_scale_factor = target_spacing / pixel_spacing_v
+
+    # Calculate output dimensions
+    output_width = int(image.size[0] * h_scale_factor)
+    output_height = int(image.size[1] * v_scale_factor)
+
+    return image.resize((output_width, output_height))
+
 
 
 
@@ -205,7 +200,7 @@ def optimize_pixel_spacing_and_rescale(image_path, output_path, new_spacing=4.0,
         scale_y: Vertical scaling factor for testing
     """
     # Load and process image
-    img_color, img_grey = load_and_convert_image(image_path, offset_x, offset_y, scale_x, scale_y)
+    img_color, img_grey = load_and_convert_image(image_path)
     
     # Create edge-detected profiles
     img_edges_h = detect_edges_along_axis(img_grey, axis=1)
@@ -225,7 +220,8 @@ def optimize_pixel_spacing_and_rescale(image_path, output_path, new_spacing=4.0,
     print(f"Optimal spacings - Horizontal: {optimal_spacing_h:.2f}, Vertical: {optimal_spacing_v:.2f}")
     
     # Rescale and save image
-    img_scaled = rescale_image_to_target_spacing(img_color, optimal_spacing_h, optimal_spacing_v, new_spacing)
+    img_scaled = rescale_image_to_target_spacing(img_color, optimal_spacing_h, optimal_spacing_v, new_spacing,
+                                                 scale_x, scale_y, offset_x, offset_y)
     img_scaled.save(output_path)
 
     print(f"Original image dimensions: {img_color.size[0]}x{img_color.size[1]}")

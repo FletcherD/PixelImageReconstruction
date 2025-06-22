@@ -127,59 +127,137 @@ class PixelArtDataSynthesizer:
         return image.crop((left, top, right, bottom))
     
     def scale_to_final(self, image: Image.Image, transform_params: Tuple[float, float, float, float]) -> Image.Image:
-                 """Scale image to final size using precise coordinate mapping."""
-                 from scipy.ndimage import map_coordinates
-
-                 x_scale, y_scale, x_offset, y_offset = transform_params
-
-                 # Convert PIL image to numpy array
-                 img_array = np.array(image)
-
-                 # Generate coordinate grid for 128x128 output
-                 output_size = self.input_size  # 128
-                 y_coords, x_coords = np.mgrid[0:output_size, 0:output_size]
-
-                 x_coords = x_coords + x_offset * 2.0
-                 y_coords = y_coords + y_offset * 2.0
-
-                 # Map output coordinates to input coordinates
-                 # For now, simple linear mapping from output space to input space
-                 input_height, input_width = img_array.shape[:2]
-
-                 # Scale coordinates to map from [0, output_size-1] to [0, input_size-1]
-                 x_coords = x_coords * (input_width - 1) / (output_size - 1)
-                 y_coords = y_coords * (input_height - 1) / (output_size - 1)
-
-                 x_coords = (x_coords / 2) + ((input_width - 1)/4)
-                 y_coords = (y_coords / 2) + ((input_height - 1)/4)
-
-                 x_center = (input_width - 1) / 2
-                 x_coords = (x_coords - x_center) * np.exp(x_scale * 0.5) + x_center
-                 y_center = (input_height - 1) / 2
-                 y_coords = (y_coords - y_center) * np.exp(y_scale * 0.5) + y_center
-
-                 # Apply map_coordinates for each channel
-                 if len(img_array.shape) == 3:  # RGB image
-                     output_array = np.zeros((output_size, output_size, 3), dtype=img_array.dtype)
-                     for c in range(3):
-                         output_array[:, :, c] = map_coordinates(
-                             img_array[:, :, c],
-                             [y_coords, x_coords],
-                             order=3,  # Bilinear interpolation
-                             mode='constant',
-                             cval=0
-                         )
-                 else:  # Grayscale
-                     output_array = map_coordinates(
-                         img_array,
-                         [y_coords, x_coords],
-                         order=3,
-                         mode='constant',
-                         cval=0
-                     )
-
-                 # Convert back to PIL Image
-                 return Image.fromarray(output_array.astype(np.uint8))
+        """Scale image to final size using precise coordinate mapping with optimized backends."""
+        x_scale, y_scale, x_offset, y_offset = transform_params
+        
+        # Convert PIL image to numpy array
+        img_array = np.array(image)
+        
+        # Generate coordinate grid for output
+        output_size = self.input_size
+        y_coords, x_coords = np.mgrid[0:output_size, 0:output_size]
+        
+        x_coords = x_coords + x_offset * 2.0
+        y_coords = y_coords + y_offset * 2.0
+        
+        # Map output coordinates to input coordinates
+        input_height, input_width = img_array.shape[:2]
+        
+        # Scale coordinates to map from [0, output_size-1] to [0, input_size-1]
+        x_coords = x_coords * (input_width - 1) / (output_size - 1)
+        y_coords = y_coords * (input_height - 1) / (output_size - 1)
+        
+        x_coords = (x_coords / 2) + ((input_width - 1)/4)
+        y_coords = (y_coords / 2) + ((input_height - 1)/4)
+        
+        x_center = np.median(x_coords)
+        x_coords = (x_coords - x_center) * np.exp(x_scale * 0.5) + x_center
+        y_center = np.median(y_coords)
+        y_coords = (y_coords - y_center) * np.exp(y_scale * 0.5) + y_center
+        
+        # Try OpenCV first (fastest), fallback to PyTorch, then scipy
+        try:
+            import cv2
+            return self._scale_to_final_opencv(img_array, x_coords, y_coords, output_size)
+        except ImportError:
+            pass
+            
+        try:
+            import torch
+            return self._scale_to_final_pytorch(img_array, x_coords, y_coords, output_size)
+        except ImportError:
+            pass
+        
+        # Fallback to optimized scipy version
+        return self._scale_to_final_scipy_optimized(img_array, x_coords, y_coords, output_size)
+    
+    def _scale_to_final_opencv(self, img_array, x_coords, y_coords, output_size):
+        """OpenCV implementation - fastest option."""
+        import cv2
+        
+        # OpenCV expects float32 maps
+        map_x = x_coords.astype(np.float32)
+        map_y = y_coords.astype(np.float32)
+        
+        # Use cv2.remap with cubic interpolation
+        output_array = cv2.remap(
+            img_array, 
+            map_x, 
+            map_y, 
+            interpolation=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+        
+        return Image.fromarray(output_array.astype(np.uint8))
+    
+    def _scale_to_final_pytorch(self, img_array, x_coords, y_coords, output_size):
+        """PyTorch implementation - GPU accelerated if available."""
+        import torch
+        import torch.nn.functional as F
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Convert to torch tensor and move to device
+        if len(img_array.shape) == 3:
+            # Convert from HWC to CHW format
+            img_tensor = torch.from_numpy(img_array.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
+        else:
+            img_tensor = torch.from_numpy(img_array).float().unsqueeze(0).unsqueeze(0).to(device)
+        
+        # Normalize coordinates to [-1, 1] range for grid_sample
+        input_height, input_width = img_array.shape[:2]
+        norm_x = 2.0 * x_coords / (input_width - 1) - 1.0
+        norm_y = 2.0 * y_coords / (input_height - 1) - 1.0
+        
+        # Create grid for sampling
+        grid = torch.stack([
+            torch.from_numpy(norm_x).float(),
+            torch.from_numpy(norm_y).float()
+        ], dim=-1).unsqueeze(0).to(device)
+        
+        # Sample using bilinear interpolation
+        output_tensor = F.grid_sample(
+            img_tensor, 
+            grid, 
+            mode='bilinear', 
+            padding_mode='zeros',
+            align_corners=True
+        )
+        
+        # Convert back to numpy and PIL
+        if len(img_array.shape) == 3:
+            output_array = output_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        else:
+            output_array = output_tensor.squeeze(0).squeeze(0).cpu().numpy()
+        
+        return Image.fromarray(output_array.astype(np.uint8))
+    
+    def _scale_to_final_scipy_optimized(self, img_array, x_coords, y_coords, output_size):
+        """Optimized scipy implementation with threading."""
+        from scipy.ndimage import map_coordinates
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def process_channel(channel_data):
+            return map_coordinates(
+                channel_data,
+                [y_coords, x_coords],
+                order=3,
+                mode='constant',
+                cval=0
+            )
+        
+        if len(img_array.shape) == 3:  # RGB image
+            # Process channels in parallel
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [executor.submit(process_channel, img_array[:, :, c]) for c in range(3)]
+                channels = [future.result() for future in futures]
+            
+            output_array = np.stack(channels, axis=-1)
+        else:  # Grayscale
+            output_array = process_channel(img_array)
+        
+        return Image.fromarray(output_array.astype(np.uint8))
     
     def generate_transform_params(self) -> Tuple[float, float, float, float]:
         """
@@ -199,41 +277,14 @@ class PixelArtDataSynthesizer:
         x_offset = distance * math.cos(angle)
         y_offset = distance * math.sin(angle)
         
+        x_scale = y_scale = 0
         # Random scale (-1 to 1)
-        x_scale = random.random() * 2 - 1
-        y_scale = random.random() * 2 - 1
+        if random.random() > 0.5:
+            x_scale = random.random() * 2 - 1
+        if random.random() > 0.5:
+            y_scale = random.random() * 2 - 1
         
         return x_scale, y_scale, x_offset, y_offset
-    
-    def apply_spatial_transform(self, image: torch.Tensor, transform_params: Tuple[float, float, float, float]) -> torch.Tensor:
-        """
-        Apply spatial transformation to input image based on parameters.
-        
-        Args:
-            image: Input image tensor (C, H, W)
-            transform_params: (x_scale, y_scale, x_offset, y_offset)
-        
-        Returns:
-            Transformed image tensor
-        """
-        x_scale, y_scale, x_offset, y_offset = transform_params
-        
-        # Skip transformation if all parameters are zero
-        if x_scale == 0.0 and y_scale == 0.0 and x_offset == 0.0 and y_offset == 0.0:
-            return image
-        
-        # Create affine transformation matrix
-        theta = torch.zeros(1, 2, 3, device=image.device, dtype=image.dtype)
-        theta[0, 0, 0] = math.exp(x_scale * 0.5)
-        theta[0, 1, 1] = math.exp(y_scale * 0.5)
-        theta[0, 0, 2] = x_offset / 64.0
-        theta[0, 1, 2] = y_offset / 64.0
-        
-        # Apply transformation
-        grid = torch.nn.functional.affine_grid(theta, image.unsqueeze(0).size(), align_corners=False)
-        transformed = torch.nn.functional.grid_sample(image.unsqueeze(0), grid, align_corners=False)
-        
-        return transformed.squeeze(0)
     
     def synthesize_pair(self, source_image: Image.Image) -> Tuple[Image.Image, Image.Image, Tuple[float, float, float, float]]:
         """
