@@ -127,69 +127,59 @@ class PixelArtDataSynthesizer:
         return image.crop((left, top, right, bottom))
     
     def scale_to_final(self, image: Image.Image, transform_params: Tuple[float, float, float, float]) -> Image.Image:
-        """Scale image to final size, incorporating transform parameters to avoid black borders.
-        
-        Args:
-            image: Input image to scale
-            transform_params: (x_scale, y_scale, x_offset, y_offset)
-        
-        Returns:
-            Final input_size x input_size image with proper content
-        """
-        x_scale, y_scale, x_offset, y_offset = transform_params
+                 """Scale image to final size using precise coordinate mapping."""
+                 from scipy.ndimage import map_coordinates
 
-        # Calculate base scale factors to get to 2x final size (e.g., 256x256 for 128x128 target)
-        target_intermediate_size = 2.0 * self.input_size  # e.g., 256 for 128x128 final
-        base_scale_x = target_intermediate_size / image.size[0]
-        base_scale_y = target_intermediate_size / image.size[1]
+                 x_scale, y_scale, x_offset, y_offset = transform_params
 
-        # Add the inverse transform scale factors to ensure we have enough content
-        # When transform will scale down (negative scale), we scale up more here
-        final_scale_x = base_scale_x * math.exp(-x_scale * 0.5)
-        final_scale_y = base_scale_y * math.exp(-y_scale * 0.5)
+                 # Convert PIL image to numpy array
+                 img_array = np.array(image)
 
-        # Convert offset to pixels at the target intermediate size
-        offset_x_pixels = x_offset * self.input_size / 2  # Scale offset to intermediate resolution
-        offset_y_pixels = y_offset * self.input_size / 2
+                 # Generate coordinate grid for 128x128 output
+                 output_size = self.input_size  # 128
+                 y_coords, x_coords = np.mgrid[0:output_size, 0:output_size]
 
-        # Create affine transformation matrix that combines scaling and offset
-        # PIL uses a 6-tuple (a, b, c, d, e, f) representing the matrix:
-        # | a  b  c |   |x|   |ax + by + c|
-        # | d  e  f | * |y| = |dx + ey + f|
-        # | 0  0  1 |   |1|   |    1     |
-        #
-        # For scaling + translation: a=scale_x, b=0, c=offset_x, d=0, e=scale_y, f=offset_y
-        affine_matrix = (
-            1,    # a: x scaling
-            0,                # b: xy skew
-            offset_x_pixels,  # c: x translation
-            0,                # d: yx skew
-            1,    # e: y scaling
-            offset_y_pixels   # f: y translation
-        )
+                 x_coords = x_coords + x_offset * 2.0
+                 y_coords = y_coords + y_offset * 2.0
 
-        # Calculate output size for the intermediate transformation
-        intermediate_width = int(target_intermediate_size)
-        intermediate_height = int(target_intermediate_size)
+                 # Map output coordinates to input coordinates
+                 # For now, simple linear mapping from output space to input space
+                 input_height, input_width = img_array.shape[:2]
 
-        # Apply the combined affine transformation
-        transformed_image = image.transform(
-            (intermediate_width, intermediate_height),
-            Image.AFFINE,
-            affine_matrix,
-            resample=Image.BILINEAR,
-            fillcolor=(0, 0, 127)  # Black fill for any empty areas
-        )
+                 # Scale coordinates to map from [0, output_size-1] to [0, input_size-1]
+                 x_coords = x_coords * (input_width - 1) / (output_size - 1)
+                 y_coords = y_coords * (input_height - 1) / (output_size - 1)
 
-        # Final center crop to target size (input_size x input_size)
-        left = (intermediate_width - self.input_size) // 2
-        top = (intermediate_height - self.input_size) // 2
-        right = left + self.input_size
-        bottom = top + self.input_size
-        
-        final_image = transformed_image.crop((left, top, right, bottom))
-        
-        return final_image
+                 x_coords = (x_coords / 2) + ((input_width - 1)/4)
+                 y_coords = (y_coords / 2) + ((input_height - 1)/4)
+
+                 x_center = (input_width - 1) / 2
+                 x_coords = (x_coords - x_center) * np.exp(x_scale * 0.5) + x_center
+                 y_center = (input_height - 1) / 2
+                 y_coords = (y_coords - y_center) * np.exp(y_scale * 0.5) + y_center
+
+                 # Apply map_coordinates for each channel
+                 if len(img_array.shape) == 3:  # RGB image
+                     output_array = np.zeros((output_size, output_size, 3), dtype=img_array.dtype)
+                     for c in range(3):
+                         output_array[:, :, c] = map_coordinates(
+                             img_array[:, :, c],
+                             [y_coords, x_coords],
+                             order=3,  # Bilinear interpolation
+                             mode='constant',
+                             cval=0
+                         )
+                 else:  # Grayscale
+                     output_array = map_coordinates(
+                         img_array,
+                         [y_coords, x_coords],
+                         order=3,
+                         mode='constant',
+                         cval=0
+                     )
+
+                 # Convert back to PIL Image
+                 return Image.fromarray(output_array.astype(np.uint8))
     
     def generate_transform_params(self) -> Tuple[float, float, float, float]:
         """
