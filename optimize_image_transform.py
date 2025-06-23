@@ -32,30 +32,59 @@ class ImageParameterOptimizer:
                  input_size: int = 128,
                  learning_rate: float = 0.01,
                  tolerance: float = 1e-4,
-                 max_iterations: int = 100):
+                 max_iterations: int = 100,
+                 scale_model_path: str = None,
+                 offset_model_path: str = None):
         """
         Initialize the parameter optimizer.
         
         Args:
-            model_path: Path to the trained scale/offset detection model
+            model_path: Path to the trained scale/offset detection model (fallback if separate models not specified)
             input_size: Input size for the model
             learning_rate: Initial learning rate for gradient descent
             tolerance: Convergence tolerance
             max_iterations: Maximum number of optimization iterations
+            scale_model_path: Optional separate model for scale predictions
+            offset_model_path: Optional separate model for offset predictions
         """
         self.model_path = model_path
+        self.scale_model_path = scale_model_path or model_path
+        self.offset_model_path = offset_model_path or model_path
         self.input_size = input_size
         self.learning_rate = learning_rate
         self.tolerance = tolerance
         self.max_iterations = max_iterations
         
-        # Initialize inference engine
-        print("Loading scale/offset detection model...")
+        # Initialize inference engines
+        print("Loading scale/offset detection model(s)...")
+        
+        # Main inference engine (for combined predictions or fallback)
         self.inference = ScaleOffsetInference(
             model_path=model_path,
             input_size=input_size
         )
-        print("Model loaded successfully!")
+        
+        # Separate scale model if specified
+        if scale_model_path and scale_model_path != model_path:
+            print(f"Loading separate scale model: {scale_model_path}")
+            self.scale_inference = ScaleOffsetInference(
+                model_path=scale_model_path,
+                input_size=input_size
+            )
+        else:
+            self.scale_inference = self.inference
+            
+        # Separate offset model if specified  
+        if offset_model_path and offset_model_path != model_path:
+            print(f"Loading separate offset model: {offset_model_path}")
+            self.offset_inference = ScaleOffsetInference(
+                model_path=offset_model_path,
+                input_size=input_size
+            )
+        else:
+            self.offset_inference = self.inference
+            
+        print("Model(s) loaded successfully!")
         
         # Optimization history - will be populated based on optimization mode
         self.history = {}
@@ -412,13 +441,26 @@ class ImageParameterOptimizer:
         # Apply transformation to image
         transformed_image = rescale_image(original_image, scale_x, scale_y, offset_x, offset_y)
         
-        # Get patch-based predictions to access individual patch results
-        result = self.inference.predict_single(transformed_image, use_patches=True)
+        # Get predictions using appropriate models
+        offset_result = self.offset_inference.predict_single(transformed_image, use_patches=True)
+        scale_result = self.scale_inference.predict_single(transformed_image, use_patches=True)
         
-        # Calculate variance of offset predictions across patches
-        if hasattr(self.inference, 'last_patch_results') and self.inference.last_patch_results:
-            offset_x_preds = [patch['offset_x'] for patch in self.inference.last_patch_results]
-            offset_y_preds = [patch['offset_y'] for patch in self.inference.last_patch_results]
+        # Combine results for consistency with existing code
+        result = {
+            'offset_x': offset_result['offset_x'],
+            'offset_y': offset_result['offset_y'],
+            'scale_x': scale_result['scale_x'],
+            'scale_y': scale_result['scale_y'],
+            'offset_x_std': offset_result.get('offset_x_std', 0.0),
+            'offset_y_std': offset_result.get('offset_y_std', 0.0),
+            'scale_x_std': scale_result.get('scale_x_std', 0.0),
+            'scale_y_std': scale_result.get('scale_y_std', 0.0),
+        }
+        
+        # Calculate variance of offset predictions across patches using offset model
+        if hasattr(self.offset_inference, 'last_patch_results') and self.offset_inference.last_patch_results:
+            offset_x_preds = [patch['offset_x'] for patch in self.offset_inference.last_patch_results]
+            offset_y_preds = [patch['offset_y'] for patch in self.offset_inference.last_patch_results]
             
             var_offset_x = np.var(offset_x_preds)
             var_offset_y = np.var(offset_y_preds)
@@ -431,10 +473,39 @@ class ImageParameterOptimizer:
         
         return variance_loss, result
 
+    def variance_x_objective(self, scale_x: float, offset_x: float, 
+                            scale_y: float, offset_y: float, 
+                            original_image: Image.Image) -> float:
+        """Objective function for X variance only."""
+        transformed_image = rescale_image(original_image, scale_x, scale_y, offset_x, offset_y)
+        result = self.offset_inference.predict_single(transformed_image, use_patches=True)
+        
+        if hasattr(self.offset_inference, 'last_patch_results') and self.offset_inference.last_patch_results:
+            offset_x_preds = [patch['offset_x'] for patch in self.offset_inference.last_patch_results]
+            return np.var(offset_x_preds)
+        else:
+            return result.get('offset_x_std', 0.0) ** 2
+
+    def variance_y_objective(self, scale_y: float, offset_y: float,
+                            scale_x: float, offset_x: float,
+                            original_image: Image.Image) -> float:
+        """Objective function for Y variance only."""
+        transformed_image = rescale_image(original_image, scale_x, scale_y, offset_x, offset_y)
+        result = self.offset_inference.predict_single(transformed_image, use_patches=True)
+        
+        if hasattr(self.offset_inference, 'last_patch_results') and self.offset_inference.last_patch_results:
+            offset_y_preds = [patch['offset_y'] for patch in self.offset_inference.last_patch_results]
+            return np.var(offset_y_preds)
+        else:
+            return result.get('offset_y_std', 0.0) ** 2
+
     def optimize_variance(self, 
                          image_path: str,
                          initial_scale: Tuple[float, float] = (1.0, 1.0),
                          initial_offset: Tuple[float, float] = (0.0, 0.0),
+                         optimizer_type: str = "adam",
+                         scale_prediction_weight: float = 0.1,
+                         offset_prediction_weight: float = 0.1,
                          verbose: bool = True) -> Dict:
         """
         Optimize both scale and offset to minimize variance of predicted offsets across patches.
@@ -443,6 +514,9 @@ class ImageParameterOptimizer:
             image_path: Path to the image to optimize
             initial_scale: Initial (scale_x, scale_y) values
             initial_offset: Initial (offset_x, offset_y) values
+            optimizer_type: Type of optimizer ("sgd", "momentum", "adam", "rmsprop", "adagrad")
+            scale_prediction_weight: Weight for scale prediction guidance term
+            offset_prediction_weight: Weight for offset prediction guidance term
             verbose: Whether to print progress
             
         Returns:
@@ -455,6 +529,27 @@ class ImageParameterOptimizer:
         scale_x, scale_y = initial_scale
         offset_x, offset_y = initial_offset
         current_lr = self.learning_rate
+        
+        # Initialize optimizer-specific state variables
+        if optimizer_type == "momentum":
+            # Momentum terms
+            v_scale_x = v_scale_y = v_offset_x = v_offset_y = 0.0
+            momentum = 0.9
+        elif optimizer_type == "adam":
+            # Adam first and second moment estimates
+            m_scale_x = m_scale_y = m_offset_x = m_offset_y = 0.0
+            v_scale_x = v_scale_y = v_offset_x = v_offset_y = 0.0
+            beta1, beta2 = 0.9, 0.999
+            epsilon_adam = 1e-8
+        elif optimizer_type == "rmsprop":
+            # RMSprop moving average of squared gradients
+            v_scale_x = v_scale_y = v_offset_x = v_offset_y = 0.0
+            decay_rate = 0.9
+            epsilon_rms = 1e-8
+        elif optimizer_type == "adagrad":
+            # Adagrad accumulated squared gradients
+            G_scale_x = G_scale_y = G_offset_x = G_offset_y = 0.0
+            epsilon_ada = 1e-8
         
         # Initialize history for variance optimization
         self.history = {
@@ -469,11 +564,22 @@ class ImageParameterOptimizer:
             'pred_offset_x_std': [],
             'pred_offset_y_std': [],
             'offset_variance_x': [],
-            'offset_variance_y': []
+            'offset_variance_y': [],
+            'pred_scale_x': [],
+            'pred_scale_y': [],
+            'scale_guidance_x': [],
+            'scale_guidance_y': [],
+            'offset_guidance_x': [],
+            'offset_guidance_y': []
         }
         
         if verbose:
             print(f"Starting variance-based optimization for {image_path}")
+            print(f"Optimizer: {optimizer_type.upper()}")
+            print(f"Scale prediction weight: {scale_prediction_weight}")
+            print(f"Offset prediction weight: {offset_prediction_weight}")
+            print(f"Scale model: {self.scale_model_path}")
+            print(f"Offset model: {self.offset_model_path}")
             print(f"Initial scale: ({scale_x:.4f}, {scale_y:.4f})")
             print(f"Initial offset: ({offset_x:.4f}, {offset_y:.4f})")
             print(f"Target: minimize variance of offset predictions across patches")
@@ -510,12 +616,19 @@ class ImageParameterOptimizer:
             self.history['pred_offset_y_std'].append(result.get('offset_y_std', 0))
             self.history['offset_variance_x'].append(var_offset_x)
             self.history['offset_variance_y'].append(var_offset_y)
+            self.history['pred_scale_x'].append(result['scale_x'])
+            self.history['pred_scale_y'].append(result['scale_y'])
+            self.history['scale_guidance_x'].append(scale_prediction_weight * result['scale_x'])
+            self.history['scale_guidance_y'].append(scale_prediction_weight * result['scale_y'])
+            self.history['offset_guidance_x'].append(offset_prediction_weight * result['offset_x'])
+            self.history['offset_guidance_y'].append(offset_prediction_weight * result['offset_y'])
             self.history['loss'].append(loss)
             self.history['learning_rates'].append(current_lr)
             
             if verbose:
                 print(f"Iter {iteration:3d}: Scale=({scale_x:.4f}, {scale_y:.4f}) "
                       f"Offset=({offset_x:.4f}, {offset_y:.4f}) "
+                      f"PredScale=({result['scale_x']:+.3f}, {result['scale_y']:+.3f}) "
                       f"OffsetVar=({var_offset_x:.6f}, {var_offset_y:.6f}) "
                       f"Loss={loss:.6f} LR={current_lr:.4f}")
             
@@ -552,35 +665,123 @@ class ImageParameterOptimizer:
                 # Clamp learning rate
                 current_lr = np.clip(current_lr, 1e-4, 0.05)
             
-            # Compute numerical gradient for variance objective
+            # Compute numerical gradients for independent X and Y problems
             epsilon = 0.001
             
-            # Gradient w.r.t. scale_x
-            loss_plus_sx, _ = self.variance_objective_function(scale_x + epsilon, scale_y, offset_x, offset_y, original_image)
-            loss_minus_sx, _ = self.variance_objective_function(scale_x - epsilon, scale_y, offset_x, offset_y, original_image)
-            grad_scale_x = (loss_plus_sx - loss_minus_sx) / (2 * epsilon)
+            # X component: gradient w.r.t. scale_x and offset_x for X variance only
+            var_x_plus_sx = self.variance_x_objective(scale_x + epsilon, offset_x, scale_y, offset_y, original_image)
+            var_x_minus_sx = self.variance_x_objective(scale_x - epsilon, offset_x, scale_y, offset_y, original_image)
+            var_x_grad_scale_x = (var_x_plus_sx - var_x_minus_sx) / (2 * epsilon)
             
-            # Gradient w.r.t. scale_y
-            loss_plus_sy, _ = self.variance_objective_function(scale_x, scale_y + epsilon, offset_x, offset_y, original_image)
-            loss_minus_sy, _ = self.variance_objective_function(scale_x, scale_y - epsilon, offset_x, offset_y, original_image)
-            grad_scale_y = (loss_plus_sy - loss_minus_sy) / (2 * epsilon)
+            var_x_plus_ox = self.variance_x_objective(scale_x, offset_x + epsilon, scale_y, offset_y, original_image)
+            var_x_minus_ox = self.variance_x_objective(scale_x, offset_x - epsilon, scale_y, offset_y, original_image)
+            var_x_grad_offset_x = (var_x_plus_ox - var_x_minus_ox) / (2 * epsilon)
             
-            # Gradient w.r.t. offset_x
-            loss_plus_ox, _ = self.variance_objective_function(scale_x, scale_y, offset_x + epsilon, offset_y, original_image)
-            loss_minus_ox, _ = self.variance_objective_function(scale_x, scale_y, offset_x - epsilon, offset_y, original_image)
-            grad_offset_x = (loss_plus_ox - loss_minus_ox) / (2 * epsilon)
+            # Y component: gradient w.r.t. scale_y and offset_y for Y variance only
+            var_y_plus_sy = self.variance_y_objective(scale_y + epsilon, offset_y, scale_x, offset_x, original_image)
+            var_y_minus_sy = self.variance_y_objective(scale_y - epsilon, offset_y, scale_x, offset_x, original_image)
+            var_y_grad_scale_y = (var_y_plus_sy - var_y_minus_sy) / (2 * epsilon)
             
-            # Gradient w.r.t. offset_y
-            loss_plus_oy, _ = self.variance_objective_function(scale_x, scale_y, offset_x, offset_y + epsilon, original_image)
-            loss_minus_oy, _ = self.variance_objective_function(scale_x, scale_y, offset_x, offset_y - epsilon, original_image)
-            grad_offset_y = (loss_plus_oy - loss_minus_oy) / (2 * epsilon)
+            var_y_plus_oy = self.variance_y_objective(scale_y, offset_y + epsilon, scale_x, offset_x, original_image)
+            var_y_minus_oy = self.variance_y_objective(scale_y, offset_y - epsilon, scale_x, offset_x, original_image)
+            var_y_grad_offset_y = (var_y_plus_oy - var_y_minus_oy) / (2 * epsilon)
             
-            # Update parameters using gradient descent
-            # Scale updates more slowly (half the learning rate)
-            scale_x -= current_lr * 0.5 * grad_scale_x
-            scale_y -= current_lr * 0.5 * grad_scale_y
-            offset_x -= current_lr * grad_offset_x
-            offset_y -= current_lr * grad_offset_y
+            # Add prediction guidance terms
+            # If predicted scale is negative, we want to increase actual scale (negative gradient)
+            # If predicted scale is positive, we want to decrease actual scale (positive gradient)
+            pred_scale_x = result['scale_x']
+            pred_scale_y = result['scale_y']
+            scale_guidance_x = scale_prediction_weight * pred_scale_x
+            scale_guidance_y = scale_prediction_weight * pred_scale_y
+            
+            # If predicted offset is negative, we want to increase actual offset (negative gradient)
+            # If predicted offset is positive, we want to decrease actual offset (positive gradient)
+            pred_offset_x = result['offset_x']
+            pred_offset_y = result['offset_y']
+            offset_guidance_x = offset_prediction_weight * pred_offset_x
+            offset_guidance_y = offset_prediction_weight * pred_offset_y
+            
+            # Combine variance gradients with prediction guidance
+            combined_grad_scale_x = var_x_grad_scale_x + scale_guidance_x
+            combined_grad_scale_y = var_y_grad_scale_y + scale_guidance_y
+            combined_grad_offset_x = var_x_grad_offset_x + offset_guidance_x
+            combined_grad_offset_y = var_y_grad_offset_y + offset_guidance_y
+            
+            # Update parameters using selected optimizer (treating X and Y independently)
+            # Scale updates more slowly (half the learning rate for scale)
+            scale_lr = current_lr
+            offset_lr = current_lr
+            
+            if optimizer_type == "sgd":
+                # Standard SGD
+                scale_x -= scale_lr * combined_grad_scale_x
+                scale_y -= scale_lr * combined_grad_scale_y
+                offset_x -= offset_lr * combined_grad_offset_x
+                offset_y -= offset_lr * combined_grad_offset_y
+                
+            elif optimizer_type == "momentum":
+                # SGD with momentum
+                v_scale_x = momentum * v_scale_x + scale_lr * combined_grad_scale_x
+                v_scale_y = momentum * v_scale_y + scale_lr * combined_grad_scale_y
+                v_offset_x = momentum * v_offset_x + offset_lr * combined_grad_offset_x
+                v_offset_y = momentum * v_offset_y + offset_lr * combined_grad_offset_y
+                
+                scale_x -= v_scale_x
+                scale_y -= v_scale_y
+                offset_x -= v_offset_x
+                offset_y -= v_offset_y
+                
+            elif optimizer_type == "adam":
+                # Adam optimizer
+                m_scale_x = beta1 * m_scale_x + (1 - beta1) * combined_grad_scale_x
+                m_scale_y = beta1 * m_scale_y + (1 - beta1) * combined_grad_scale_y
+                m_offset_x = beta1 * m_offset_x + (1 - beta1) * combined_grad_offset_x
+                m_offset_y = beta1 * m_offset_y + (1 - beta1) * combined_grad_offset_y
+                
+                v_scale_x = beta2 * v_scale_x + (1 - beta2) * combined_grad_scale_x**2
+                v_scale_y = beta2 * v_scale_y + (1 - beta2) * combined_grad_scale_y**2
+                v_offset_x = beta2 * v_offset_x + (1 - beta2) * combined_grad_offset_x**2
+                v_offset_y = beta2 * v_offset_y + (1 - beta2) * combined_grad_offset_y**2
+                
+                # Bias correction
+                m_scale_x_hat = m_scale_x / (1 - beta1**(iteration + 1))
+                m_scale_y_hat = m_scale_y / (1 - beta1**(iteration + 1))
+                m_offset_x_hat = m_offset_x / (1 - beta1**(iteration + 1))
+                m_offset_y_hat = m_offset_y / (1 - beta1**(iteration + 1))
+                
+                v_scale_x_hat = v_scale_x / (1 - beta2**(iteration + 1))
+                v_scale_y_hat = v_scale_y / (1 - beta2**(iteration + 1))
+                v_offset_x_hat = v_offset_x / (1 - beta2**(iteration + 1))
+                v_offset_y_hat = v_offset_y / (1 - beta2**(iteration + 1))
+                
+                scale_x -= scale_lr * m_scale_x_hat / (np.sqrt(v_scale_x_hat) + epsilon_adam)
+                scale_y -= scale_lr * m_scale_y_hat / (np.sqrt(v_scale_y_hat) + epsilon_adam)
+                offset_x -= offset_lr * m_offset_x_hat / (np.sqrt(v_offset_x_hat) + epsilon_adam)
+                offset_y -= offset_lr * m_offset_y_hat / (np.sqrt(v_offset_y_hat) + epsilon_adam)
+                
+            elif optimizer_type == "rmsprop":
+                # RMSprop
+                v_scale_x = decay_rate * v_scale_x + (1 - decay_rate) * combined_grad_scale_x**2
+                v_scale_y = decay_rate * v_scale_y + (1 - decay_rate) * combined_grad_scale_y**2
+                v_offset_x = decay_rate * v_offset_x + (1 - decay_rate) * combined_grad_offset_x**2
+                v_offset_y = decay_rate * v_offset_y + (1 - decay_rate) * combined_grad_offset_y**2
+                
+                scale_x -= scale_lr * combined_grad_scale_x / (np.sqrt(v_scale_x) + epsilon_rms)
+                scale_y -= scale_lr * combined_grad_scale_y / (np.sqrt(v_scale_y) + epsilon_rms)
+                offset_x -= offset_lr * combined_grad_offset_x / (np.sqrt(v_offset_x) + epsilon_rms)
+                offset_y -= offset_lr * combined_grad_offset_y / (np.sqrt(v_offset_y) + epsilon_rms)
+                
+            elif optimizer_type == "adagrad":
+                # Adagrad
+                G_scale_x += combined_grad_scale_x**2
+                G_scale_y += combined_grad_scale_y**2
+                G_offset_x += combined_grad_offset_x**2
+                G_offset_y += combined_grad_offset_y**2
+                
+                scale_x -= scale_lr * combined_grad_scale_x / (np.sqrt(G_scale_x) + epsilon_ada)
+                scale_y -= scale_lr * combined_grad_scale_y / (np.sqrt(G_scale_y) + epsilon_ada)
+                offset_x -= offset_lr * combined_grad_offset_x / (np.sqrt(G_offset_x) + epsilon_ada)
+                offset_y -= offset_lr * combined_grad_offset_y / (np.sqrt(G_offset_y) + epsilon_ada)
             
             # Constrain parameters to reasonable ranges
             scale_x = np.clip(scale_x, 0.5, 5.0)
@@ -606,6 +807,9 @@ class ImageParameterOptimizer:
             'optimize_scale': True,
             'optimize_offset': True,
             'optimization_type': 'variance',
+            'optimizer_type': optimizer_type,
+            'scale_prediction_weight': scale_prediction_weight,
+            'offset_prediction_weight': offset_prediction_weight,
             'original_size': original_image.size,
             'optimized_size': (
                 int(original_image.size[0] * best_scales[0]),
@@ -730,6 +934,46 @@ class ImageParameterOptimizer:
             ax.grid(True, alpha=0.3)
             ax.set_yscale('log')
             plot_idx += 1
+            
+        # Scale prediction guidance plots
+        if is_variance_opt and 'pred_scale_x' in history:
+            # Scale predictions over time
+            ax = axes[plot_idx]
+            ax.plot(iterations, history['pred_scale_x'], 'r-', label='Predicted Scale X', linewidth=2)
+            ax.plot(iterations, history['pred_scale_y'], 'g-', label='Predicted Scale Y', linewidth=2)
+            ax.axhline(y=0.0, color='k', linestyle='--', alpha=0.5, label='Target')
+            ax.set_xlabel('Iteration')
+            ax.set_ylabel('Predicted Scale')
+            ax.set_title('Scale Model Predictions')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
+            
+            # Scale guidance terms over time
+            if 'scale_guidance_x' in history:
+                ax = axes[plot_idx]
+                ax.plot(iterations, history['scale_guidance_x'], 'r-', label='Scale X Guidance', linewidth=2)
+                ax.plot(iterations, history['scale_guidance_y'], 'g-', label='Scale Y Guidance', linewidth=2)
+                ax.axhline(y=0.0, color='k', linestyle='--', alpha=0.5)
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Scale Guidance Term')
+                ax.set_title('Scale Prediction Guidance')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                plot_idx += 1
+                
+            # Offset guidance terms over time
+            if 'offset_guidance_x' in history:
+                ax = axes[plot_idx]
+                ax.plot(iterations, history['offset_guidance_x'], 'r-', label='Offset X Guidance', linewidth=2)
+                ax.plot(iterations, history['offset_guidance_y'], 'g-', label='Offset Y Guidance', linewidth=2)
+                ax.axhline(y=0.0, color='k', linestyle='--', alpha=0.5)
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Offset Guidance Term')
+                ax.set_title('Offset Prediction Guidance')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                plot_idx += 1
         
         # Learning rate over time
         if plot_idx < len(axes):
@@ -784,6 +1028,10 @@ def main():
                        help="Input image path")
     parser.add_argument("--model_path", type=str, required=True,
                        help="Path to trained scale/offset detection model")
+    parser.add_argument("--scale_model_path", type=str,
+                       help="Optional separate model for scale predictions")
+    parser.add_argument("--offset_model_path", type=str,
+                       help="Optional separate model for offset predictions")
     parser.add_argument("--output_image", type=str,
                        help="Path to save optimized image")
     parser.add_argument("--output_plot", type=str, default="optimization_plot.png",
@@ -808,6 +1056,12 @@ def main():
                        help="Maximum optimization iterations")
     parser.add_argument("--tolerance", type=float, default=1e-4,
                        help="Convergence tolerance")
+    parser.add_argument("--optimizer", type=str, choices=["sgd", "momentum", "adam", "rmsprop", "adagrad"], default="adam",
+                       help="Optimizer type for variance optimization")
+    parser.add_argument("--scale_pred_weight", type=float, default=0.1,
+                       help="Weight for scale prediction guidance term (variance optimization only)")
+    parser.add_argument("--offset_pred_weight", type=float, default=0.1,
+                       help="Weight for offset prediction guidance term (variance optimization only)")
     
     # System parameters
     parser.add_argument("--input_size", type=int, default=128,
@@ -828,6 +1082,14 @@ def main():
         print(f"Error: Model file not found: {args.model_path}")
         return 1
     
+    if args.scale_model_path and not os.path.exists(args.scale_model_path):
+        print(f"Error: Scale model file not found: {args.scale_model_path}")
+        return 1
+        
+    if args.offset_model_path and not os.path.exists(args.offset_model_path):
+        print(f"Error: Offset model file not found: {args.offset_model_path}")
+        return 1
+    
     # Determine optimization mode
     optimize_scale = args.optimize in ["scale", "both"]
     optimize_offset = args.optimize in ["offset", "both"]
@@ -840,7 +1102,9 @@ def main():
             input_size=args.input_size,
             learning_rate=args.learning_rate,
             tolerance=args.tolerance,
-            max_iterations=args.max_iterations
+            max_iterations=args.max_iterations,
+            scale_model_path=args.scale_model_path,
+            offset_model_path=args.offset_model_path
         )
         
         # Run optimization
@@ -849,6 +1113,9 @@ def main():
                 image_path=args.image,
                 initial_scale=(args.initial_scale_x, args.initial_scale_y),
                 initial_offset=(args.initial_offset_x, args.initial_offset_y),
+                optimizer_type=args.optimizer,
+                scale_prediction_weight=args.scale_pred_weight,
+                offset_prediction_weight=args.offset_pred_weight,
                 verbose=not args.quiet
             )
         else:
