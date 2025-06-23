@@ -137,9 +137,6 @@ class PixelArtDataSynthesizer:
         output_size = self.input_size
         y_coords, x_coords = np.mgrid[0:output_size, 0:output_size]
         
-        x_coords = x_coords + x_offset * 2.0
-        y_coords = y_coords + y_offset * 2.0
-        
         # Map output coordinates to input coordinates
         input_height, input_width = img_array.shape[:2]
         
@@ -151,9 +148,12 @@ class PixelArtDataSynthesizer:
         y_coords = (y_coords / 2) + ((input_height - 1)/4)
         
         x_center = np.median(x_coords)
-        x_coords = (x_coords - x_center) * np.exp(x_scale * 0.5) + x_center
+        x_coords = (x_coords - x_center) * np.exp(x_scale * 0.2) + x_center
         y_center = np.median(y_coords)
-        y_coords = (y_coords - y_center) * np.exp(y_scale * 0.5) + y_center
+        y_coords = (y_coords - y_center) * np.exp(y_scale * 0.2) + y_center
+
+        x_coords = x_coords + (x_offset / 64.0)
+        y_coords = y_coords + (y_offset / 64.0)
         
         # Try OpenCV first (fastest), fallback to PyTorch, then scipy
         try:

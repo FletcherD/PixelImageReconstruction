@@ -506,6 +506,8 @@ class ImageParameterOptimizer:
                          optimizer_type: str = "adam",
                          scale_prediction_weight: float = 0.1,
                          offset_prediction_weight: float = 0.1,
+                         scale_lr_multiplier: float = 1.0,
+                         offset_lr_multiplier: float = 1.0,
                          verbose: bool = True) -> Dict:
         """
         Optimize both scale and offset to minimize variance of predicted offsets across patches.
@@ -517,6 +519,8 @@ class ImageParameterOptimizer:
             optimizer_type: Type of optimizer ("sgd", "momentum", "adam", "rmsprop", "adagrad")
             scale_prediction_weight: Weight for scale prediction guidance term
             offset_prediction_weight: Weight for offset prediction guidance term
+            scale_lr_multiplier: Learning rate multiplier for scale parameters
+            offset_lr_multiplier: Learning rate multiplier for offset parameters
             verbose: Whether to print progress
             
         Returns:
@@ -578,6 +582,8 @@ class ImageParameterOptimizer:
             print(f"Optimizer: {optimizer_type.upper()}")
             print(f"Scale prediction weight: {scale_prediction_weight}")
             print(f"Offset prediction weight: {offset_prediction_weight}")
+            print(f"Scale learning rate multiplier: {scale_lr_multiplier}")
+            print(f"Offset learning rate multiplier: {offset_lr_multiplier}")
             print(f"Scale model: {self.scale_model_path}")
             print(f"Offset model: {self.offset_model_path}")
             print(f"Initial scale: ({scale_x:.4f}, {scale_y:.4f})")
@@ -708,9 +714,9 @@ class ImageParameterOptimizer:
             combined_grad_offset_y = var_y_grad_offset_y + offset_guidance_y
             
             # Update parameters using selected optimizer (treating X and Y independently)
-            # Scale updates more slowly (half the learning rate for scale)
-            scale_lr = current_lr
-            offset_lr = current_lr
+            # Apply learning rate multipliers
+            scale_lr = current_lr * scale_lr_multiplier
+            offset_lr = current_lr * offset_lr_multiplier
             
             if optimizer_type == "sgd":
                 # Standard SGD
@@ -810,6 +816,8 @@ class ImageParameterOptimizer:
             'optimizer_type': optimizer_type,
             'scale_prediction_weight': scale_prediction_weight,
             'offset_prediction_weight': offset_prediction_weight,
+            'scale_lr_multiplier': scale_lr_multiplier,
+            'offset_lr_multiplier': offset_lr_multiplier,
             'original_size': original_image.size,
             'optimized_size': (
                 int(original_image.size[0] * best_scales[0]),
@@ -1062,6 +1070,10 @@ def main():
                        help="Weight for scale prediction guidance term (variance optimization only)")
     parser.add_argument("--offset_pred_weight", type=float, default=0.1,
                        help="Weight for offset prediction guidance term (variance optimization only)")
+    parser.add_argument("--scale_lr_mult", type=float, default=1.0,
+                       help="Learning rate multiplier for scale parameters (variance optimization only)")
+    parser.add_argument("--offset_lr_mult", type=float, default=1.0,
+                       help="Learning rate multiplier for offset parameters (variance optimization only)")
     
     # System parameters
     parser.add_argument("--input_size", type=int, default=128,
@@ -1116,6 +1128,8 @@ def main():
                 optimizer_type=args.optimizer,
                 scale_prediction_weight=args.scale_pred_weight,
                 offset_prediction_weight=args.offset_pred_weight,
+                scale_lr_multiplier=args.scale_lr_mult,
+                offset_lr_multiplier=args.offset_lr_mult,
                 verbose=not args.quiet
             )
         else:
