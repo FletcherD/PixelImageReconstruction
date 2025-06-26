@@ -22,6 +22,7 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 from datasets import load_dataset, Dataset as HFDataset
+from palette_utils import posterize_image_to_palette, palette_indices_to_one_hot
 
 
 class PixelArtDataSynthesizer:
@@ -33,6 +34,7 @@ class PixelArtDataSynthesizer:
                  complexity_threshold: float = 10.0,
                  max_retries: int = 10,
                  transform_fraction: float = 0.0,
+                 palette: Optional[np.ndarray] = None,
                  seed: Optional[int] = None):
         """
         Args:
@@ -41,6 +43,7 @@ class PixelArtDataSynthesizer:
             complexity_threshold: Minimum standard deviation for image complexity
             max_retries: Maximum attempts to find a complex enough crop
             transform_fraction: Fraction of samples to apply spatial transformations to (0.0-1.0)
+            palette: Optional palette for posterization (N, 3) RGB values [0, 255]
             seed: Random seed for reproducibility
         """        
         # Internal crop size is 2x the target size to avoid black borders
@@ -50,6 +53,7 @@ class PixelArtDataSynthesizer:
         self.complexity_threshold = complexity_threshold
         self.max_retries = max_retries
         self.transform_fraction = transform_fraction
+        self.palette = palette
         
         if seed is not None:
             random.seed(seed)
@@ -286,16 +290,21 @@ class PixelArtDataSynthesizer:
         
         return x_scale, y_scale, x_offset, y_offset
     
-    def synthesize_pair(self, source_image: Image.Image) -> Tuple[Image.Image, Image.Image, Tuple[float, float, float, float]]:
+    def synthesize_pair(self, source_image: Image.Image) -> Tuple[Image.Image, Union[Image.Image, np.ndarray], Tuple[float, float, float, float]]:
         """
         Create a (input, ground_truth) pair from source image with optional spatial transformation.
         
         Returns:
-            Tuple of (degraded_input, ground_truth_patch, transform_params)
+            Tuple of (degraded_input, ground_truth_data, transform_params)
+            - degraded_input: PIL Image for input
+            - ground_truth_data: PIL Image (normal mode) or numpy array of indices (palette mode)
+            - transform_params: Transformation parameters
         """
         # Step 1: Random crop with complexity checking
         for attempt in range(self.max_retries):
             cropped = self.random_crop(source_image)
+
+            cropped = self.posterize_image(cropped)
 
             # Step 2: Extract center region (this becomes our ground truth)
             ground_truth = self.extract_center_region(cropped)
@@ -321,7 +330,14 @@ class PixelArtDataSynthesizer:
         # Step 5: Scale to final with transform parameters (this becomes our input)
         input_image = self.scale_to_final(compressed, transform_params)
         
-        return input_image, ground_truth, transform_params
+        # Step 6: Handle palette mode if palette is provided
+        if self.palette is not None:
+            # Posterize ground truth to palette and return indices
+            _, ground_truth_indices = posterize_image_to_palette(ground_truth, self.palette)
+            return input_image, ground_truth_indices, transform_params
+        else:
+            # Return normal RGB ground truth
+            return input_image, ground_truth, transform_params
 
 
 class PixelArtDataset(Dataset):
@@ -335,7 +351,8 @@ class PixelArtDataset(Dataset):
                  transform_fraction: float,
                  synthesizer: Optional[PixelArtDataSynthesizer] = None,
                  transform_input: Optional[transforms.Compose] = None,
-                 transform_target: Optional[transforms.Compose] = None
+                 transform_target: Optional[transforms.Compose] = None,
+                 palette: Optional[np.ndarray] = None
                  ):
         """
         Args:
@@ -347,13 +364,15 @@ class PixelArtDataset(Dataset):
             target_size: Size of the target ground truth image
             input_size: Size of the final input image
             transform_fraction: Fraction of samples to apply spatial transformations to (0.0-1.0)
+            palette: Optional palette for posterization mode
         """
         self.source_images_dir = Path(source_images_dir)
         self.num_samples = num_samples
         self.synthesizer = synthesizer or PixelArtDataSynthesizer(
             target_size=target_size,
             input_size=input_size, 
-            transform_fraction=transform_fraction
+            transform_fraction=transform_fraction,
+            palette=palette
         )
         self.transform_input = transform_input
         self.transform_target = transform_target
@@ -385,7 +404,7 @@ class PixelArtDataset(Dataset):
             source_image = Image.open(self.source_image_paths[0]).convert('RGB')
         
         # Synthesize input/target pair with transformation parameters
-        input_image, target_image, transform_params = self.synthesizer.synthesize_pair(source_image)
+        input_image, target_data, transform_params = self.synthesizer.synthesize_pair(source_image)
         
         # Apply transforms
         if self.transform_input:
@@ -393,10 +412,16 @@ class PixelArtDataset(Dataset):
         else:
             input_tensor = transforms.ToTensor()(input_image)
         
-        if self.transform_target:
-            target_tensor = self.transform_target(target_image)
+        # Handle palette mode vs regular mode
+        if isinstance(target_data, np.ndarray):
+            # Palette mode - target_data is indices array
+            target_tensor = torch.from_numpy(target_data).long()
         else:
-            target_tensor = transforms.ToTensor()(target_image)
+            # Regular mode - target_data is PIL Image
+            if self.transform_target:
+                target_tensor = self.transform_target(target_data)
+            else:
+                target_tensor = transforms.ToTensor()(target_data)
         
         # Create target data combining image and transformation parameters
         # For scale/offset training, we need both the image and transform params
@@ -421,6 +446,7 @@ class HuggingFacePixelArtDataset(Dataset):
                  split: str = "train",
                  image_column: str = "image",
                  streaming: bool = False,
+                 palette: Optional[np.ndarray] = None,
                  **load_dataset_kwargs):
         """
         Args:
@@ -435,6 +461,7 @@ class HuggingFacePixelArtDataset(Dataset):
             target_size: Size of the target ground truth image
             input_size: Size of the final input image
             transform_fraction: Fraction of samples to apply spatial transformations to (0.0-1.0)
+            palette: Optional palette for posterization mode
             **load_dataset_kwargs: Additional arguments to pass to load_dataset
         """        
         self.dataset_name = dataset_name
@@ -442,7 +469,8 @@ class HuggingFacePixelArtDataset(Dataset):
         self.synthesizer = synthesizer or PixelArtDataSynthesizer(
             target_size=target_size,
             input_size=input_size,
-            transform_fraction=transform_fraction
+            transform_fraction=transform_fraction,
+            palette=palette
         )
         self.transform_input = transform_input
         self.transform_target = transform_target
@@ -499,7 +527,7 @@ class HuggingFacePixelArtDataset(Dataset):
             source_image = source_image.convert('RGB')
         
         # Synthesize input/target pair with transformation parameters
-        input_image, target_image, transform_params = self.synthesizer.synthesize_pair(source_image)
+        input_image, target_data, transform_params = self.synthesizer.synthesize_pair(source_image)
         
         # Apply transforms
         if self.transform_input:
@@ -507,10 +535,16 @@ class HuggingFacePixelArtDataset(Dataset):
         else:
             input_tensor = transforms.ToTensor()(input_image)
         
-        if self.transform_target:
-            target_tensor = self.transform_target(target_image)
+        # Handle palette mode vs regular mode
+        if isinstance(target_data, np.ndarray):
+            # Palette mode - target_data is indices array
+            target_tensor = torch.from_numpy(target_data).long()
         else:
-            target_tensor = transforms.ToTensor()(target_image)
+            # Regular mode - target_data is PIL Image
+            if self.transform_target:
+                target_tensor = self.transform_target(target_data)
+            else:
+                target_tensor = transforms.ToTensor()(target_data)
         
         # Create target data combining image and transformation parameters
         # For scale/offset training, we need both the image and transform params
@@ -530,6 +564,7 @@ def create_hf_dataset(dataset_name: str,
                      image_column: str = "image",
                      streaming: bool = False,
                      transform_fraction: float = 0.0,
+                     palette: Optional[np.ndarray] = None,
                      **load_dataset_kwargs) -> HuggingFacePixelArtDataset:
     """
     Create a HuggingFacePixelArtDataset and optionally save some examples.
@@ -542,6 +577,7 @@ def create_hf_dataset(dataset_name: str,
         split: Dataset split to use (train, validation, test)
         image_column: Name of the column containing images
         streaming: Whether to use streaming mode for large datasets
+        palette: Optional palette for posterization mode
         **load_dataset_kwargs: Additional arguments to pass to load_dataset
         
     Returns:
@@ -567,12 +603,13 @@ def create_hf_dataset(dataset_name: str,
         target_size=target_size,
         input_size=input_size,
         transform_fraction=transform_fraction,
+        palette=palette,
         **load_dataset_kwargs
     )
     
     if save_examples:
         os.makedirs(examples_dir, exist_ok=True)
-        synthesizer = PixelArtDataSynthesizer(target_size=target_size, input_size=input_size, transform_fraction=transform_fraction, seed=69)  # Fixed seed for reproducible examples
+        synthesizer = PixelArtDataSynthesizer(target_size=target_size, input_size=input_size, transform_fraction=transform_fraction, palette=palette, seed=69)  # Fixed seed for reproducible examples
         
         print(f"Saving example pairs to {examples_dir}/")
         for i in range(min(10, num_samples)):  # Limit examples to 10
@@ -613,7 +650,8 @@ def create_dataset(source_images_dir: str,
                   input_size: int,
                   save_examples: bool = False,
                   examples_dir: str = "dataset_examples",
-                  transform_fraction: float = 0.0) -> PixelArtDataset:
+                  transform_fraction: float = 0.0,
+                  palette: Optional[np.ndarray] = None) -> PixelArtDataset:
     """
     Create a PixelArtDataset and optionally save some examples.
     
@@ -622,6 +660,7 @@ def create_dataset(source_images_dir: str,
         num_samples: Number of samples in the dataset
         save_examples: Whether to save example pairs
         examples_dir: Directory to save examples
+        palette: Optional palette for posterization mode
         
     Returns:
         PixelArtDataset instance
@@ -642,12 +681,13 @@ def create_dataset(source_images_dir: str,
         transform_target=target_transform,
         target_size=target_size,
         input_size=input_size,
-        transform_fraction=transform_fraction
+        transform_fraction=transform_fraction,
+        palette=palette
     )
     
     if save_examples:
         os.makedirs(examples_dir, exist_ok=True)
-        synthesizer = PixelArtDataSynthesizer(target_size=target_size, input_size=input_size, transform_fraction=transform_fraction, seed=42)  # Fixed seed for reproducible examples
+        synthesizer = PixelArtDataSynthesizer(target_size=target_size, input_size=input_size, transform_fraction=transform_fraction, palette=palette, seed=42)  # Fixed seed for reproducible examples
         
         print(f"Saving example pairs to {examples_dir}/")
         for i in range(min(10, num_samples)):  # Limit examples to 10

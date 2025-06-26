@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Patch-based inference script for image reconstruction using MediumUNet.
+Patch-based inference script for image reconstruction using MediumUNet64x16.
 
-Takes a large image and reconstructs it using the trained MediumUNet model.
-The model takes 128x128 patches and outputs 32x32 patches.
-Uses non-overlapping 32x32 windows for efficient reconstruction.
+Takes a large image and reconstructs it using the trained MediumUNet64x16 model.
+The model takes 64x64 patches and outputs 16x16 patches.
+Uses non-overlapping 16x16 windows for efficient reconstruction.
 """
 
 import torch
@@ -17,7 +17,7 @@ import sys
 import os
 import pandas as pd
 
-from medium_unet import MediumUNet
+from medium_unet import MediumUNet64x16
 
 
 def enable_dropout(model):
@@ -35,8 +35,8 @@ def disable_dropout(model):
 
 
 def load_model(checkpoint_path: str, device: torch.device):
-    """Load the trained MediumUNet model from checkpoint."""
-    model = MediumUNet()
+    """Load the trained MediumUNet64x16 model from checkpoint."""
+    model = MediumUNet64x16()
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
@@ -62,13 +62,13 @@ def preprocess_patch(patch: np.ndarray) -> torch.Tensor:
     return patch_tensor
 
 
-def pad_image_for_reconstruction(image: np.ndarray, input_stride: int = 128) -> tuple:
+def pad_image_for_reconstruction(image: np.ndarray, input_stride: int = 64) -> tuple:
     """
     Pad image to make dimensions divisible by input_stride.
     
     Args:
         image: Input image as numpy array (H, W, C)
-        input_stride: Size of input stride (128x128) for 1/4 resolution output
+        input_stride: Size of input stride (64x64) for 1/4 resolution output
     
     Returns:
         Tuple of (padded_image, padding_info)
@@ -94,24 +94,24 @@ def pad_image_for_reconstruction(image: np.ndarray, input_stride: int = 128) -> 
 
 
 def extract_input_patch(image: np.ndarray, i: int, j: int, 
-                       patch_size: int = 32, window_size: int = 128) -> np.ndarray:
+                       patch_size: int = 16, window_size: int = 64) -> np.ndarray:
     """
-    Extract 128x128 input patch centered on 32x32 output region.
+    Extract 64x64 input patch centered on 16x16 output region.
     
     Args:
         image: Input image
-        i, j: Top-left coordinates of 32x32 output region
-        patch_size: Size of output patch (32)
-        window_size: Size of input window (128)
+        i, j: Top-left coordinates of 16x16 output region
+        patch_size: Size of output patch (16)
+        window_size: Size of input window (64)
     
     Returns:
-        128x128 input patch
+        64x64 input patch
     """
-    # Calculate center of 32x32 region
+    # Calculate center of 16x16 region
     center_y = i + patch_size // 2
     center_x = j + patch_size // 2
     
-    # Calculate 128x128 window coordinates
+    # Calculate 64x64 window coordinates
     half_window = window_size // 2
     y_start = center_y - half_window
     y_end = center_y + half_window
@@ -153,8 +153,8 @@ def mc_dropout_inference_single_patch(model: torch.nn.Module, patch_tensor: torc
     while the model's sigma_sq represents aleatoric uncertainty.
     
     Args:
-        model: Trained CompactUNet model
-        patch_tensor: Input patch tensor (1, 3, 128, 128)
+        model: Trained MediumUNet64x16 model
+        patch_tensor: Input patch tensor (1, 3, 64, 64)
         n_samples: Number of Monte Carlo samples
     
     Returns:
@@ -176,16 +176,16 @@ def mc_dropout_inference_single_patch(model: torch.nn.Module, patch_tensor: torc
     # Disable dropout after sampling
     disable_dropout(model)
     
-    # Convert to numpy arrays: (n_samples, 1, 3, 32, 32)
+    # Convert to numpy arrays: (n_samples, 1, 3, 16, 16)
     mu_predictions = np.array(mu_predictions)
     sigma_sq_predictions = np.array(sigma_sq_predictions)
     
     # Calculate mean across samples for mu (epistemic uncertainty)
-    mean_mu = np.mean(mu_predictions, axis=0)  # (1, 3, 32, 32)
-    var_mu = np.var(mu_predictions, axis=0)    # (1, 3, 32, 32) - epistemic uncertainty
+    mean_mu = np.mean(mu_predictions, axis=0)  # (1, 3, 16, 16)
+    var_mu = np.var(mu_predictions, axis=0)    # (1, 3, 16, 16) - epistemic uncertainty
     
     # Average the predicted aleatoric uncertainty (sigma_sq)
-    mean_sigma_sq = np.mean(sigma_sq_predictions, axis=0)  # (1, 3, 32, 32)
+    mean_sigma_sq = np.mean(sigma_sq_predictions, axis=0)  # (1, 3, 16, 16)
     
     # Total uncertainty = epistemic + aleatoric
     total_uncertainty = var_mu + mean_sigma_sq
@@ -194,17 +194,17 @@ def mc_dropout_inference_single_patch(model: torch.nn.Module, patch_tensor: torc
 
 
 def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                        patch_size: int = 32, window_size: int = 128, 
+                        patch_size: int = 16, window_size: int = 64, 
                         collect_transforms: bool = False) -> tuple:
     """
     Perform tile-based inference on the input image.
     
     Args:
         image: Input image as numpy array (H, W, C)
-        model: Trained CompactUNet model
+        model: Trained MediumUNet64x16 model
         device: PyTorch device
-        patch_size: Size of output patches (32x32)
-        window_size: Size of input window (128x128)
+        patch_size: Size of output patches (16x16)
+        window_size: Size of input window (64x64)
     
     Returns:
         Tuple of (mean_output, variance_output) both at 1/4 resolution of input
@@ -243,7 +243,7 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
                 input_y_start = tile_y * input_stride
                 input_x_start = tile_x * input_stride
                 
-                # Extract 128x128 input patch
+                # Extract 64x64 input patch
                 input_patch = padded_image[input_y_start:input_y_start + window_size,
                                          input_x_start:input_x_start + window_size, :]
                 
@@ -255,12 +255,12 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
                 # Preprocess patch
                 patch_tensor = preprocess_patch(input_patch).to(device)
                 
-                # Get model prediction (32x32 patch only)
+                # Get model prediction (16x16 patch only)
                 mu = model(patch_tensor)
                 
                 # Convert predictions back to numpy
-                # mu shape: (1, 3, 32, 32)
-                patch_mean = mu.squeeze(0).cpu().numpy().transpose(1, 2, 0)      # (32, 32, 3)
+                # mu shape: (1, 3, 16, 16)
+                patch_mean = mu.squeeze(0).cpu().numpy().transpose(1, 2, 0)      # (16, 16, 3)
                 
                 # No transform parameters available from this model
                 if collect_transforms:
@@ -306,17 +306,17 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
 
 
 def tile_based_inference_mc_dropout(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                                   patch_size: int = 32, window_size: int = 128, 
+                                   patch_size: int = 16, window_size: int = 64, 
                                    n_samples: int = 10) -> tuple:
     """
     Perform tile-based inference with Monte Carlo dropout for uncertainty estimation.
     
     Args:
         image: Input image as numpy array (H, W, C)
-        model: Trained CompactUNet model
+        model: Trained MediumUNet64x16 model
         device: PyTorch device
-        patch_size: Size of output patches (32x32)
-        window_size: Size of input window (128x128)
+        patch_size: Size of output patches (16x16)
+        window_size: Size of input window (64x64)
         n_samples: Number of Monte Carlo dropout samples
     
     Returns:
@@ -354,7 +354,7 @@ def tile_based_inference_mc_dropout(image: np.ndarray, model: torch.nn.Module, d
             input_y_start = tile_y * input_stride
             input_x_start = tile_x * input_stride
             
-            # Extract 128x128 input patch
+            # Extract 64x64 input patch
             input_patch = padded_image[input_y_start:input_y_start + window_size,
                                      input_x_start:input_x_start + window_size, :]
             
@@ -370,9 +370,9 @@ def tile_based_inference_mc_dropout(image: np.ndarray, model: torch.nn.Module, d
             mean_pred, var_pred = mc_dropout_inference_single_patch(model, patch_tensor, n_samples)
             
             # Convert predictions back to numpy
-            # mean_pred shape: (1, 3, 32, 32), var_pred shape: (1, 3, 32, 32)
-            patch_mean = mean_pred.squeeze(0).transpose(1, 2, 0)  # (32, 32, 3)
-            patch_var = var_pred.squeeze(0).transpose(1, 2, 0)    # (32, 32, 3)
+            # mean_pred shape: (1, 3, 16, 16), var_pred shape: (1, 3, 16, 16)
+            patch_mean = mean_pred.squeeze(0).transpose(1, 2, 0)  # (16, 16, 3)
+            patch_var = var_pred.squeeze(0).transpose(1, 2, 0)    # (16, 16, 3)
             
             # Store in output arrays (coordinates in output space)
             output_y_start = tile_y * patch_size
@@ -400,17 +400,17 @@ def tile_based_inference_mc_dropout(image: np.ndarray, model: torch.nn.Module, d
 
 
 def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torch.device, 
-                        patch_size: int = 32, window_size: int = 128, batch_size: int = 16,
+                        patch_size: int = 16, window_size: int = 64, batch_size: int = 16,
                         collect_transforms: bool = False) -> tuple:
     """
     Perform batched tile-based inference for better GPU utilization.
     
     Args:
         image: Input image as numpy array (H, W, C)
-        model: Trained CompactUNet model
+        model: Trained MediumUNet64x16 model
         device: PyTorch device
-        patch_size: Size of output patches (32x32)
-        window_size: Size of input window (128x128)
+        patch_size: Size of output patches (16x16)
+        window_size: Size of input window (64x64)
         batch_size: Number of tiles to process in parallel
     
     Returns:
@@ -455,7 +455,7 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
             input_y_start = tile_y * input_stride
             input_x_start = tile_x * input_stride
             
-            # Extract 128x128 input patch
+            # Extract 64x64 input patch
             input_patch = padded_image[input_y_start:input_y_start + window_size,
                                      input_x_start:input_x_start + window_size, :]
             
@@ -476,11 +476,11 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
             ]).to(device)
             
             # Get model predictions
-            mu_batch = model(batch_tensor)  # Shape: (batch_size, 3, 32, 32)
+            mu_batch = model(batch_tensor)  # Shape: (batch_size, 3, 16, 16)
             
             # Store results
             for idx, (tile_y, tile_x) in enumerate(batch_coords):
-                patch_mean = mu_batch[idx].cpu().numpy().transpose(1, 2, 0)      # (32, 32, 3)
+                patch_mean = mu_batch[idx].cpu().numpy().transpose(1, 2, 0)      # (16, 16, 3)
                 patch_variance = np.zeros_like(patch_mean)  # No variance from this model
                 
                 # Collect transform parameters if requested
@@ -533,14 +533,14 @@ def postprocess_output(output: np.ndarray) -> np.ndarray:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Patch-based inference for image reconstruction using MediumUNet')
+    parser = argparse.ArgumentParser(description='Patch-based inference for image reconstruction using MediumUNet64x16')
     parser.add_argument('input_image', type=str, help='Path to input image')
-    parser.add_argument('--model', type=str, default='checkpoints-medium-unet/best_model.pth',
+    parser.add_argument('--model', type=str, default='checkpoints-medium-unet-64x16/best_model.pth',
                        help='Path to model checkpoint')
     parser.add_argument('--output', type=str, help='Output image path (default: input_reconstructed.png)')
     # Removed --use-gap since MediumUNet doesn't have a GAP variant
-    parser.add_argument('--patch-size', type=int, default=32, help='Output patch size')
-    parser.add_argument('--window-size', type=int, default=128, help='Input window size')
+    parser.add_argument('--patch-size', type=int, default=16, help='Output patch size')
+    parser.add_argument('--window-size', type=int, default=64, help='Input window size')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for inference')
     parser.add_argument('--device', type=str, default='auto', help='Device to use (cpu, cuda, auto)')
     parser.add_argument('--use-batched', action='store_true', help='Use batched inference (faster)')
@@ -666,7 +666,7 @@ def main():
     print(f"\nStatistics:")
     print(f"Input resolution: {image_array.shape[1]}x{image_array.shape[0]}")
     print(f"Output resolution: {output_image.shape[1]}x{output_image.shape[0]}")
-    print(f"Model: MediumUNet")
+    print(f"Model: MediumUNet64x16")
     print(f"Patch size: {args.patch_size}x{args.patch_size}")
     print(f"Window size: {args.window_size}x{args.window_size}")
     if args.mc_dropout:

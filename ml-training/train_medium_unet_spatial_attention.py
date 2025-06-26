@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Training script for MediumUNet64x16 model using the data synthesis pipeline.
+Training script for MediumUNetSpatialAttention64x16 model using the data synthesis pipeline.
 Uses both local images and HuggingFace 'nerijs/pixelparti-128-v0.1' dataset.
 Configured for 64x64 input patches with 16x16 center patch prediction.
 
-MediumUNet64x16 is a more sophisticated model for simple patch reconstruction.
+MediumUNetSpatialAttention64x16 adds spatial self-attention for better region coherence
+and boundary preservation in pixel art reconstruction.
 """
 
 import os
@@ -24,7 +25,7 @@ from tqdm import tqdm
 import wandb
 
 # Import our modules
-from medium_unet import MediumUNet64x16, count_parameters, mse_loss
+from medium_unet import MediumUNetSpatialAttention64x16, count_parameters, mse_loss
 from data_synthesis_pipeline import (
     PixelArtDataSynthesizer, 
     PixelArtDataset, 
@@ -301,7 +302,7 @@ def load_checkpoint(model, optimizer, filepath, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train MediumUNet64x16 for patch prediction')
+    parser = argparse.ArgumentParser(description='Train MediumUNetSpatialAttention64x16 for patch prediction')
     
     # Dataset arguments
     parser.add_argument('--source_images_dir', type=str, 
@@ -321,7 +322,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=64,
-                       help='Batch size (increased for compact model)')
+                       help='Batch size')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                        help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5,
@@ -329,8 +330,7 @@ def main():
     parser.add_argument('--val_split', type=float, default=0.1,
                        help='Validation split ratio')
     
-    # Model arguments (MediumUNet only has one type)
-    # Removed model_type since MediumUNet doesn't have a GAP variant
+    # Model arguments
     parser.add_argument('--dropout', type=float, default=0.1,
                        help='Dropout rate')
     parser.add_argument('--use_transpose', action='store_true', default=True,
@@ -338,7 +338,8 @@ def main():
     parser.add_argument('--final_activation', type=str, default='sigmoid',
                        choices=['sigmoid', 'tanh', 'relu', 'none'],
                        help='Final activation function')
-    
+    parser.add_argument('--attention_reduction', type=int, default=8,
+                       help='Reduction factor for spatial attention channels')
     
     # Training setup
     parser.add_argument('--seed', type=int, default=42,
@@ -347,11 +348,11 @@ def main():
                        help='Number of data loader workers')
     parser.add_argument('--save_every', type=int, default=1,
                        help='Save checkpoint every N epochs')
-    parser.add_argument('--output_dir', type=str, default='checkpoints-medium-unet-64x16',
+    parser.add_argument('--output_dir', type=str, default='checkpoints-medium-unet-spatial-attention-64x16',
                        help='Output directory for checkpoints')
     
     # Wandb arguments
-    parser.add_argument('--wandb_project', type=str, default='medium-unet-64x16',
+    parser.add_argument('--wandb_project', type=str, default='medium-unet-spatial-attention-64x16',
                        help='Wandb project name')
     parser.add_argument('--wandb_run_name', type=str, default=None,
                        help='Wandb run name')
@@ -411,16 +412,17 @@ def main():
     )
     
     # Create model
-    model = MediumUNet64x16(
+    model = MediumUNetSpatialAttention64x16(
         dropout=args.dropout,
         use_transpose=args.use_transpose,
-        final_activation=args.final_activation
+        final_activation=args.final_activation,
+        attention_reduction=args.attention_reduction
     )
     
     model = model.to(device)
     print(f"Model parameters: {count_parameters(model):,}")
     
-    # Create optimizer (using heteroscedastic_loss function directly)
+    # Create optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
     # Learning rate scheduler
