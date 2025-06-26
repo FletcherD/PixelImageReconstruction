@@ -168,9 +168,10 @@ def mc_dropout_inference_single_patch(model: torch.nn.Module, patch_tensor: torc
     
     with torch.no_grad():
         for _ in range(n_samples):
-            mu, sigma_sq, transform_params = model(patch_tensor)
+            mu = model(patch_tensor)
             mu_predictions.append(mu.cpu().numpy())
-            sigma_sq_predictions.append(sigma_sq.cpu().numpy())
+            # No sigma_sq or transform_params from this model
+            sigma_sq_predictions.append(np.zeros_like(mu.cpu().numpy()))
     
     # Disable dropout after sampling
     disable_dropout(model)
@@ -254,17 +255,17 @@ def tile_based_inference(image: np.ndarray, model: torch.nn.Module, device: torc
                 # Preprocess patch
                 patch_tensor = preprocess_patch(input_patch).to(device)
                 
-                # Get model prediction (32x32 patch + transform params)
-                mu, transform_params = model(patch_tensor)
+                # Get model prediction (32x32 patch only)
+                mu = model(patch_tensor)
                 
                 # Convert predictions back to numpy
-                # mu and sigma_sq shapes: (1, 3, 32, 32)
+                # mu shape: (1, 3, 32, 32)
                 patch_mean = mu.squeeze(0).cpu().numpy().transpose(1, 2, 0)      # (32, 32, 3)
-                #patch_variance = sigma_sq.squeeze(0).cpu().numpy().transpose(1, 2, 0)  # (32, 32, 3)
                 
-                # Collect transform parameters if requested
+                # No transform parameters available from this model
                 if collect_transforms:
-                    transform_vals = transform_params.squeeze(0).cpu().numpy()  # (4,)
+                    # Set default transform values since model doesn't predict them
+                    transform_vals = np.array([0.0, 0.0, 0.0, 0.0])  # [x_scale, y_scale, x_offset, y_offset]
                     transform_data.append({
                         'tile_y': tile_y,
                         'tile_x': tile_x,
@@ -475,16 +476,17 @@ def batch_tile_inference(image: np.ndarray, model: torch.nn.Module, device: torc
             ]).to(device)
             
             # Get model predictions
-            mu_batch, sigma_sq_batch, transform_batch = model(batch_tensor)  # Each: (batch_size, 3, 32, 32) and (batch_size, 4)
+            mu_batch = model(batch_tensor)  # Shape: (batch_size, 3, 32, 32)
             
             # Store results
             for idx, (tile_y, tile_x) in enumerate(batch_coords):
                 patch_mean = mu_batch[idx].cpu().numpy().transpose(1, 2, 0)      # (32, 32, 3)
-                patch_variance = sigma_sq_batch[idx].cpu().numpy().transpose(1, 2, 0)  # (32, 32, 3)
+                patch_variance = np.zeros_like(patch_mean)  # No variance from this model
                 
                 # Collect transform parameters if requested
                 if collect_transforms:
-                    transform_vals = transform_batch[idx].cpu().numpy()  # (4,)
+                    # Set default transform values since model doesn't predict them
+                    transform_vals = np.array([0.0, 0.0, 0.0, 0.0])  # [x_scale, y_scale, x_offset, y_offset]
                     transform_data.append({
                         'tile_y': tile_y,
                         'tile_x': tile_x,

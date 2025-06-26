@@ -236,118 +236,6 @@ def _scale_to_final_pytorch(img_array, x_coords, y_coords, output_size):
     return Image.fromarray(output_array.astype(np.uint8))
 
 
-def rescale_images_torch_batch(images_tensor, x_scales, y_scales, x_offsets, y_offsets, device=None):
-    """
-    Torch-native batch rescaling function that matches rescale_image functionality exactly.
-    
-    Args:
-        images_tensor (torch.Tensor): Batch of images with shape (B, C, H, W)
-        x_scales (torch.Tensor): X scale factors for each image (B,)
-        y_scales (torch.Tensor): Y scale factors for each image (B,)
-        x_offsets (torch.Tensor): X offset values for each image (B,)
-        y_offsets (torch.Tensor): Y offset values for each image (B,)
-        device (torch.device): Device to perform computations on
-        
-    Returns:
-        List[torch.Tensor]: List of rescaled image tensors (varying sizes)
-    """
-    import torch
-    import torch.nn.functional as F
-    
-    if device is None:
-        device = images_tensor.device
-    
-    batch_size = images_tensor.shape[0]
-    input_height, input_width = images_tensor.shape[2], images_tensor.shape[3]
-    
-    rescaled_images = []
-    
-    for i in range(batch_size):
-        # Get the original Python float values to avoid tensor precision loss
-        x_scale = float(x_scales[i])
-        y_scale = float(y_scales[i])
-        x_offset = float(x_offsets[i])
-        y_offset = float(y_offsets[i])
-        
-        # Calculate output dimensions (matching original rescale_image)
-        # Note: original uses PIL image.size which is (width, height) 
-        # but tensor shape is (batch, channels, height, width)
-        # So input_height corresponds to PIL height, input_width corresponds to PIL width
-        output_height = int(input_height * y_scale)  # PIL: int(image.size[1] * y_scale)
-        output_width = int(input_width * x_scale)    # PIL: int(image.size[0] * x_scale)
-        
-        
-        # Generate coordinate grid for output (matching original logic)
-        y_coords, x_coords = torch.meshgrid(
-            torch.arange(output_height, device=device, dtype=torch.float32),
-            torch.arange(output_width, device=device, dtype=torch.float32),
-            indexing='ij'
-        )
-        
-        # Apply offset (matching original: coords + offset * 2.0)
-        x_coords = x_coords + x_offset * 2.0
-        y_coords = y_coords + y_offset * 2.0
-        
-        # Map output coordinates to input coordinates (matching original logic)
-        x_center = torch.median(x_coords)
-        x_coords = x_coords / x_scale
-        y_center = torch.median(y_coords)
-        y_coords = y_coords / y_scale
-        
-        # Normalize coordinates to [-1, 1] range for grid_sample
-        norm_x = 2.0 * x_coords / (input_width - 1) - 1.0
-        norm_y = 2.0 * y_coords / (input_height - 1) - 1.0
-        
-        # Create grid for sampling (shape: H, W, 2)
-        grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)  # Add batch dim: (1, H, W, 2)
-        
-        # Sample using bilinear interpolation
-        single_image = images_tensor[i:i+1]  # Keep batch dimension: (1, C, H, W)
-        output_tensor = F.grid_sample(
-            single_image,
-            grid,
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=True
-        )
-        
-        # Remove batch dimension and add to results
-        rescaled_images.append(output_tensor.squeeze(0))  # Shape: (C, H, W)
-    
-    return rescaled_images
-
-
-def rescale_image_torch(image_tensor, x_scale=1.0, y_scale=1.0, x_offset=0.0, y_offset=0.0, device=None):
-    """
-    Torch-native single image rescaling that matches rescale_image functionality exactly.
-    
-    Args:
-        image_tensor (torch.Tensor): Single image tensor with shape (C, H, W)
-        x_scale (float): X scale factor
-        y_scale (float): Y scale factor
-        x_offset (float): X offset value
-        y_offset (float): Y offset value
-        device (torch.device): Device to perform computations on
-        
-    Returns:
-        torch.Tensor: Rescaled image tensor
-    """
-    import torch
-    
-    if device is None:
-        device = image_tensor.device
-    
-    # Use batch function with single image
-    images_batch = image_tensor.unsqueeze(0)  # Add batch dimension
-    x_scales = torch.tensor([x_scale], device=device, dtype=torch.float64)
-    y_scales = torch.tensor([y_scale], device=device, dtype=torch.float64)
-    x_offsets = torch.tensor([x_offset], device=device, dtype=torch.float64)
-    y_offsets = torch.tensor([y_offset], device=device, dtype=torch.float64)
-    
-    rescaled_batch = rescale_images_torch_batch(images_batch, x_scales, y_scales, x_offsets, y_offsets, device)
-    return rescaled_batch[0]  # Return single image
-
-
 
 
 def optimize_pixel_spacing_and_rescale(image_path, output_path, new_spacing=4.0, offset_x=0, offset_y=0, scale_x=1.0, scale_y=1.0):
@@ -415,13 +303,13 @@ def main():
     )
     parser.add_argument(
         "--offset-x",
-        type=int,
+        type=float,
         default=0,
         help="Horizontal offset in pixels for testing (default: 0)"
     )
     parser.add_argument(
         "--offset-y",
-        type=int,
+        type=float,
         default=0,
         help="Vertical offset in pixels for testing (default: 0)"
     )

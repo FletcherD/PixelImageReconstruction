@@ -3,7 +3,7 @@
 Medium U-Net architecture for patch-based denoising from 128x128 inputs.
 
 Input: 128x128x3 RGB patches (noisy images)
-Output: 32x32x3 RGB patches (center region prediction) + 4 transform parameters
+Output: 32x32x3 RGB patches (center region prediction)
 
 This is a more sophisticated version of CompactUNet with:
 - Deeper network (5 encoder levels)
@@ -251,17 +251,6 @@ class MediumUNet(nn.Module):
             nn.Conv2d(32, out_channels, 1)
         )
         
-        # Transform prediction head - more sophisticated than CompactUNet
-        self.transform_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(64, 256, 1),
-            nn.SiLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Conv2d(256, 64, 1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(64, 4, 1),
-            nn.Flatten()
-        )
     
     def forward(self, x):
         # Encoder path
@@ -280,24 +269,13 @@ class MediumUNet(nn.Module):
         # Final convolution for image prediction
         mu = self.final_conv(dec_out)      # 32x32x3
         
-        # Transform prediction from final decoder features
-        transform_out = self.transform_head(dec_out)  # 4 scalars
-        
         # Apply activation to image output
         if self.final_activation == 'sigmoid':
             mu = torch.sigmoid(mu)
         elif self.final_activation == 'tanh':
             mu = torch.tanh(mu)
         
-        # Process transform predictions
-        x_scale = torch.tanh(transform_out[:, 0])  # Range [-1, 1]
-        y_scale = torch.tanh(transform_out[:, 1])  # Range [-1, 1]
-        x_offset = torch.tanh(transform_out[:, 2])  # Range [-1, 1]
-        y_offset = torch.tanh(transform_out[:, 3])  # Range [-1, 1]
-        
-        transform_params = torch.stack([x_scale, y_scale, x_offset, y_offset], dim=1)
-        
-        return mu, transform_params
+        return mu
 
 
 def count_parameters(model):
@@ -328,11 +306,10 @@ def test_model():
     print(f"MediumUNet parameters: {count_parameters(model):,}")
     
     with torch.no_grad():
-        mu, transform_params = model(x)
+        mu = model(x)
     
-    print(f"Mu shape: {mu.shape}, Transform params shape: {transform_params.shape}")
+    print(f"Mu shape: {mu.shape}")
     print(f"Mu range: [{mu.min():.3f}, {mu.max():.3f}]")
-    print(f"Transform params range: [{transform_params.min():.3f}, {transform_params.max():.3f}]")
     
     # Test loss function
     target = torch.randn_like(mu)
