@@ -188,7 +188,7 @@ class EnhancedMediumUNetSpatialAttention64x16(nn.Module):
         if self.final_activation == 'sigmoid':
             mu = torch.sigmoid(mu)
         elif self.final_activation == 'tanh':
-            mu = torch.tanh(mu)
+            mu = torch.tanh(mu) * 0.5 + 0.5  # Map from [-1,1] to [0,1]
         elif self.final_activation == 'relu':
             mu = torch.relu(mu)
         
@@ -321,7 +321,7 @@ class ConfigurableAttentionUNet64x16(nn.Module):
         if self.final_activation == 'sigmoid':
             mu = torch.sigmoid(mu)
         elif self.final_activation == 'tanh':
-            mu = torch.tanh(mu)
+            mu = torch.tanh(mu) * 0.5 + 0.5  # Map from [-1,1] to [0,1]
         elif self.final_activation == 'relu':
             mu = torch.relu(mu)
         
